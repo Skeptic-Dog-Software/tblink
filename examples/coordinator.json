@@ -1,0 +1,24 @@
+{
+  "api": "http://127.0.0.1:8000",
+  "settings_path": "~/.omlx/settings.json",
+  "brew": "/opt/homebrew/bin/brew",
+  "service": "jundot/omlx/omlx",
+  "ssh_key": "~/.ssh/omlx_cluster",
+  "peer_tblink": "/usr/local/bin/tblink",
+  "local": { "node_id": "<coordinator node id from ~/.omlx/cluster/identity.json>", "rdma_ip": "10.0.1.1", "bridge_ip": "10.77.0.1" },
+  "peer":  { "node_id": "<peer node id>", "rdma_ip": "10.0.1.2", "bridge_ip": "10.77.0.2", "ssh_user": "<peer login>" },
+  "plan_request": {
+    "model_path": "/Users/Shared/omlx-models/<model directory>",
+    "nodes": [
+      { "node_id": "<coordinator node id>", "capacity_bytes": 37462008324, "role": "headless", "memory_guard_tier": "aggressive" },
+      { "node_id": "<peer node id>", "capacity_bytes": 34155749856, "role": "headless", "memory_guard_tier": "aggressive" }
+    ],
+    "execution_profile": "interactive",
+    "target_context_tokens": 32768,
+    "tensor_parallel_size": 2
+  },
+  "interval_secs": 15,
+  "backoff_secs": 120,
+  "jaccl_retry_secs": 1800,
+  "jaccl_failures_before_ring": 2
+}
