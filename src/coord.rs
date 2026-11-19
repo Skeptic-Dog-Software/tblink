@@ -322,11 +322,101 @@ pub fn main(config_path: &str, once: bool, check: bool) -> i32 {
         }
         return if problems.is_empty() { 0 } else { 1 };
     }
+    let marker = marker_path(config_path);
     let mut st = State::default();
     loop {
-        tick(&cfg, &mut st);
+        if marker.exists() {
+            // `tblink shutdown` paused us: leave oMLX and the deployment alone.
+            st.note(format!("paused by `tblink shutdown` ({}); run `tblink resume` to bring the model back", marker.display()));
+        } else {
+            tick(&cfg, &mut st);
+        }
         if once { return 0; }
         sleep_secs(cfg.interval_secs);
+    }
+}
+
+/// The default coordinator config path.
+pub const DEFAULT_CONFIG: &str = "~/.config/tblink/coordinator.json";
+
+/// The pause marker: a file named `paused` next to the coordinator config.
+/// While it exists the coordinator does nothing.
+pub fn marker_path(config_path: &str) -> std::path::PathBuf {
+    let config = std::path::PathBuf::from(expand(config_path));
+    config.parent().map(|d| d.to_path_buf()).unwrap_or_default().join("paused")
+}
+
+/// Live deployments to unload on shutdown: this model's, if live.
+pub fn to_unload(deps: &Value, status: &Value, model: &str) -> Vec<String> {
+    let live = live_ids(status);
+    deps["deployments"].as_array().into_iter().flatten()
+        .filter(|d| d["model"].as_str() == Some(model))
+        .filter_map(|d| d["deployment_id"].as_str().map(str::to_string))
+        .filter(|id| live.contains(id))
+        .collect()
+}
+
+/// `tblink shutdown`: pause the coordinator, unload the deployment, stop oMLX.
+pub fn shutdown(config_path: &str) -> i32 {
+    let cfg: Config = match std::fs::read_to_string(expand(config_path)).map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("cannot read {config_path}: {e}"); return 1; }
+    };
+    let marker = marker_path(config_path);
+    if let Err(e) = std::fs::write(&marker, format!("paused by tblink shutdown at {}\n", crate::now_string())) {
+        eprintln!("cannot write {}: {e}", marker.display());
+        return 1;
+    }
+    println!("paused the coordinator ({})", marker.display());
+    if healthy(&cfg.api) {
+        if let Some(key) = read_key(&cfg.settings_path) {
+            let api = Api { base: cfg.api.clone(), key };
+            let model = cfg.plan_request["model_path"].as_str().unwrap_or_default();
+            match (api.get("/admin/api/cluster/deployments"), api.get("/admin/api/cluster/status")) {
+                (Ok(deps), Ok(status)) => {
+                    for id in to_unload(&deps, &status, model) {
+                        match api.post(&format!("/admin/api/cluster/deployments/{id}/unload"), None, 300) {
+                            Ok(_) => println!("unloaded {id}"),
+                            Err(e) => eprintln!("unload {id}: {e}"),
+                        }
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => eprintln!("could not read deployments: {e}"),
+            }
+        } else {
+            eprintln!("no API key in {}; skipping unload", cfg.settings_path);
+        }
+    } else {
+        println!("oMLX is not running");
+    }
+    let (ok, out) = net::run(&cfg.brew, &["services", "stop", &cfg.service]);
+    if ok {
+        println!("stopped {}", cfg.service);
+    } else {
+        eprintln!("brew services stop {} failed: {}", cfg.service, out.trim());
+    }
+    println!("run `tblink resume` to bring the model back");
+    0
+}
+
+/// `tblink resume`: remove the pause marker; the coordinator restarts oMLX
+/// and reloads the deployment on its next check.
+pub fn resume(config_path: &str) -> i32 {
+    let marker = marker_path(config_path);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            println!("resumed: the coordinator will start oMLX and load the deployment on its next check");
+            0
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("not paused ({} does not exist)", marker.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("cannot remove {}: {e}", marker.display());
+            1
+        }
     }
 }
 
@@ -888,6 +978,39 @@ mod tests {
         assert!(!load_ok(&json!({"loaded": "true"})));
         assert!(!load_ok(&json!({})));
         assert!(!load_ok(&Value::Null));
+    }
+
+    // ---- shutdown / resume ----
+
+    #[test]
+    fn marker_sits_next_to_the_config() {
+        assert_eq!(marker_path("/etc/tb/coordinator.json"), std::path::PathBuf::from("/etc/tb/paused"));
+        assert!(marker_path(DEFAULT_CONFIG).ends_with(".config/tblink/paused"));
+    }
+
+    #[test]
+    fn shutdown_unloads_only_this_models_live_deployment() {
+        let deps = json!({"deployments": [
+            {"deployment_id": "m-1", "model": "/m"},
+            {"deployment_id": "x-1", "model": "/other"},
+        ]});
+        let status = json!({"runtime_jobs": {"jobs": [
+            {"deployment_id": "m-1", "live": true},
+            {"deployment_id": "x-1", "live": true},
+        ]}});
+        assert_eq!(to_unload(&deps, &status, "/m"), vec!["m-1".to_string()]);
+        let idle = json!({"runtime_jobs": {"jobs": []}});
+        assert!(to_unload(&deps, &idle, "/m").is_empty(), "nothing live, nothing to unload");
+    }
+
+    #[test]
+    fn resume_without_a_marker_is_fine() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("coordinator.json");
+        assert_eq!(resume(cfg.to_str().unwrap()), 0);
+        std::fs::write(marker_path(cfg.to_str().unwrap()), "x").unwrap();
+        assert_eq!(resume(cfg.to_str().unwrap()), 0);
+        assert!(!marker_path(cfg.to_str().unwrap()).exists());
     }
 
     // ---- --check ----

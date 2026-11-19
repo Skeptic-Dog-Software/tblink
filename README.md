@@ -21,6 +21,8 @@ One binary, three subcommands:
 | `tblink port` | root LaunchDaemon, **both** Macs | Every 5 s: finds the active RDMA-capable Thunderbolt port. Puts this Mac's RDMA address (`10.0.1.N/24`) and its bridge address (`10.77.0.N/24`) on that port. Removes stale copies from inactive ports and from `bridge0`. Takes the port out of `bridge0` and points the subnet routes at it. |
 | `tblink coordinator` | user LaunchAgent, **coordinator Mac only** | Every 15 s: keeps the oMLX brew service up and bound to every configured address. Reads both Macs' active ports (the peer's over SSH via `tblink status`). If the ports changed, it rebuilds the deployment, unloading the old one first, and loads it. If JACCL fails to load twice, it falls back to TCP Ring over the bridge addresses and retries JACCL after 30 min. |
 | `tblink status [--json]` | anyone | Read-only view of the ports, addresses and bridge membership. |
+| `tblink shutdown [--config PATH]` | coordinator Mac, logged-in user | Pauses the coordinator, unloads the model's deployment and stops the oMLX service, so the machines are free for other work. The port daemons keep running. |
+| `tblink resume [--config PATH]` | coordinator Mac, logged-in user | Removes the pause; on its next check the coordinator starts oMLX and reloads the deployment. |
 
 The bridge addresses move onto the RDMA port, so SSH, Screen Sharing and API clients keep using `10.77.0.x` after the port leaves the bridge.
 
@@ -41,6 +43,10 @@ cp examples/coordinator.json ~/.config/tblink/coordinator.json   # fill in node 
 Node IDs are in `~/.omlx/cluster/identity.json` on each Mac. `plan_request` is the body oMLX's `POST /admin/api/cluster/plan` takes. `capacity_bytes` should come from `POST /admin/api/cluster/node-budgets` while no model is loaded.
 
 Logs: `/var/log/tblink.log` (port daemon) and `~/Library/Logs/tblink.log` (coordinator).
+
+`--config` defaults to `~/.config/tblink/coordinator.json`. The pause is a file
+named `paused` next to that config, so it survives reboots: a paused cluster
+stays down until `tblink resume`.
 
 Remove with `sudo ./install.sh uninstall-port` and `./install.sh uninstall-coordinator`.
 

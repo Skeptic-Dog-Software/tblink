@@ -17,6 +17,12 @@ pub fn log(msg: &str) {
     println!("{} {msg}", ts.trim());
 }
 
+/// The current local time for messages, e.g. 2026-11-19T15:04:05-0700.
+pub fn now_string() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    net::run("/bin/date", &["-r", &secs.to_string(), "+%Y-%m-%dT%H:%M:%S%z"]).1.trim().to_string()
+}
+
 pub fn sleep_secs(s: u64) {
     std::thread::sleep(Duration::from_secs(s));
 }
@@ -24,7 +30,9 @@ pub fn sleep_secs(s: u64) {
 const USAGE: &str = "usage:
   tblink status [--json]
   tblink port --rdma-ip 10.0.1.N [--bridge-ip 10.77.0.N] [--peer IP]... [--interval SECS] [--once] [--dry-run]
-  tblink coordinator --config PATH [--once] [--check]";
+  tblink coordinator --config PATH [--once] [--check]
+  tblink shutdown [--config PATH]   pause the coordinator, unload the model, stop oMLX
+  tblink resume [--config PATH]     let the coordinator bring the model back";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq)]
@@ -32,6 +40,8 @@ enum Cmd {
     Status { json: bool },
     Port(port::PortArgs),
     Coordinator { config: String, once: bool, check: bool },
+    Shutdown { config: String },
+    Resume { config: String },
 }
 
 /// Parse the arguments after the program name. `None` means print usage.
@@ -52,6 +62,8 @@ fn parse(args: &[String]) -> Option<Cmd> {
             dry_run: flag("--dry-run"),
         })),
         Some("coordinator") => value("--config").map(|config| Cmd::Coordinator { config, once: flag("--once"), check: flag("--check") }),
+        Some("shutdown") => Some(Cmd::Shutdown { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
+        Some("resume") => Some(Cmd::Resume { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
         _ => None,
     }
 }
@@ -70,6 +82,8 @@ fn main() {
         }
         Some(Cmd::Port(a)) => port::main(a),
         Some(Cmd::Coordinator { config, once, check }) => coord::main(&config, once, check),
+        Some(Cmd::Shutdown { config }) => coord::shutdown(&config),
+        Some(Cmd::Resume { config }) => coord::resume(&config),
         None => { eprintln!("{USAGE}"); 2 }
     };
     std::process::exit(code);
@@ -186,8 +200,15 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_and_resume() {
+        assert_eq!(p("shutdown"), Some(Cmd::Shutdown { config: coord::DEFAULT_CONFIG.into() }));
+        assert_eq!(p("shutdown --config /c.json"), Some(Cmd::Shutdown { config: "/c.json".into() }));
+        assert_eq!(p("resume"), Some(Cmd::Resume { config: coord::DEFAULT_CONFIG.into() }));
+    }
+
+    #[test]
     fn usage_lists_every_subcommand() {
-        for s in ["tblink status", "tblink port", "tblink coordinator"] {
+        for s in ["tblink status", "tblink port", "tblink coordinator", "tblink shutdown", "tblink resume"] {
             assert!(USAGE.contains(s), "{s}");
         }
     }
