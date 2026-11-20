@@ -9,6 +9,8 @@
 #       User LaunchAgent on the oMLX coordinator Mac (not as root).
 #
 #   sudo ./install.sh uninstall-port | ./install.sh uninstall-coordinator
+#
+#   ./install.sh setup     guided setup (tblink setup), which calls the above
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=/usr/local/bin/tblink
@@ -82,5 +84,8 @@ uninstall-port)
 uninstall-coordinator)
   launchctl bootout "gui/$(id -u)/$COORD_LABEL" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/$COORD_LABEL.plist"; echo "removed $COORD_LABEL" ;;
+setup)
+  [ "$(id -u)" != 0 ] || { echo "run as the logged-in user, not root (setup asks for sudo when it needs it)" >&2; exit 1; }
+  exec "$(find_bin)" setup ;;
 *) sed -n '2,13p' "$0" >&2; exit 2 ;;
 esac
