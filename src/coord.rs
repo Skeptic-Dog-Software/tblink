@@ -50,11 +50,21 @@ pub struct Config {
     #[serde(default = "d2")]
     pub jaccl_failures_before_ring: u32,
 }
-fn default_peer_tblink() -> String { "/usr/local/bin/tblink".into() }
-fn d15() -> u64 { 15 }
-fn d120() -> u64 { 120 }
-fn d1800() -> u64 { 1800 }
-fn d2() -> u32 { 2 }
+fn default_peer_tblink() -> String {
+    "/usr/local/bin/tblink".into()
+}
+fn d15() -> u64 {
+    15
+}
+fn d120() -> u64 {
+    120
+}
+fn d1800() -> u64 {
+    1800
+}
+fn d2() -> u32 {
+    2
+}
 
 /// Expand a leading `~/` against `home`.
 pub fn expand_with(p: &str, home: &str) -> String {
@@ -69,12 +79,18 @@ pub fn expand(p: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Backend { Jaccl, Ring }
+pub enum Backend {
+    Jaccl,
+    Ring,
+}
 
 impl Backend {
     /// The name oMLX uses for the backend.
     pub fn name(&self) -> &'static str {
-        match self { Backend::Jaccl => "jaccl", Backend::Ring => "ring" }
+        match self {
+            Backend::Jaccl => "jaccl",
+            Backend::Ring => "ring",
+        }
     }
 }
 
@@ -104,18 +120,29 @@ pub fn jaccl_ready(cfg: &Config, local: &Status, peer: &Status) -> bool {
 
 /// JACCL when both RDMA ports are ready and no Ring fallback is in force.
 pub fn choose_backend(cfg: &Config, local: &Status, peer: &Status, ring_hold: bool) -> Backend {
-    if !jaccl_ready(cfg, local, peer) || ring_hold { Backend::Ring } else { Backend::Jaccl }
+    if !jaccl_ready(cfg, local, peer) || ring_hold {
+        Backend::Ring
+    } else {
+        Backend::Jaccl
+    }
 }
 
 /// Compare only the fields that define the link, in the shape oMLX stores them.
 pub fn hosts_match(current: &Value, want: &Value) -> bool {
     let norm = |v: &Value| -> Vec<(String, String, Value, Value)> {
-        let mut out: Vec<_> = v.as_array().into_iter().flatten().map(|h| (
-            h["node_id"].as_str().unwrap_or("").to_string(),
-            h["ssh"].as_str().unwrap_or("").to_string(),
-            h["ips"].clone(),
-            h.get("rdma").cloned().unwrap_or(json!([])),
-        )).collect();
+        let mut out: Vec<_> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| {
+                (
+                    h["node_id"].as_str().unwrap_or("").to_string(),
+                    h["ssh"].as_str().unwrap_or("").to_string(),
+                    h["ips"].clone(),
+                    h.get("rdma").cloned().unwrap_or(json!([])),
+                )
+            })
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     };
@@ -131,22 +158,25 @@ pub fn key_from_settings(text: &str) -> Option<String> {
 /// Addresses oMLX is configured to listen on, and its port, from settings.json text.
 pub fn parse_listen_config(text: Option<&str>) -> (Vec<String>, u16) {
     let v: Value = text.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let hosts = v["server"]["host"].as_str().unwrap_or("127.0.0.1")
-        .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let hosts =
+        v["server"]["host"].as_str().unwrap_or("127.0.0.1").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     (hosts, v["server"]["port"].as_u64().unwrap_or(8000) as u16)
 }
 
 /// The stored deployment for `model`, if any.
 pub fn current_deployment(deps: &Value, model: &str) -> Option<Value> {
-    deps["deployments"].as_array().into_iter().flatten()
-        .find(|d| d["model"].as_str() == Some(model)).cloned()
+    deps["deployments"].as_array().into_iter().flatten().find(|d| d["model"].as_str() == Some(model)).cloned()
 }
 
 /// Deployment ids with a live runtime job, from `/admin/api/cluster/status`.
 pub fn live_ids(status: &Value) -> Vec<String> {
-    status["runtime_jobs"]["jobs"].as_array().into_iter().flatten()
+    status["runtime_jobs"]["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|j| j["live"].as_bool() == Some(true))
-        .filter_map(|j| j["deployment_id"].as_str().map(str::to_string)).collect()
+        .filter_map(|j| j["deployment_id"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// What the coordinator should do about the deployment this tick.
@@ -192,12 +222,19 @@ pub fn load_ok(resp: &Value) -> bool {
 /// Problems `--check` reports without contacting anything.
 pub fn config_problems(cfg: &Config, key_present: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if cfg.plan_request["model_path"].as_str().is_none() { out.push("plan_request.model_path missing".to_string()); }
-    if !key_present { out.push(format!("no auth.api_key in {}", cfg.settings_path)); }
+    if cfg.plan_request["model_path"].as_str().is_none() {
+        out.push("plan_request.model_path missing".to_string());
+    }
+    if !key_present {
+        out.push(format!("no auth.api_key in {}", cfg.settings_path));
+    }
     out
 }
 
-struct Api { base: String, key: String }
+struct Api {
+    base: String,
+    key: String,
+}
 
 impl Api {
     fn req(&self, method: &str, path: &str, timeout: u64) -> ureq::Request {
@@ -210,7 +247,11 @@ impl Api {
     }
     fn post(&self, path: &str, body: Option<&Value>, timeout: u64) -> Result<Value, String> {
         let r = self.req("POST", path, timeout);
-        let resp = match body { Some(b) => r.send_json(b.clone()), None => r.call() }.map_err(err)?;
+        let resp = match body {
+            Some(b) => r.send_json(b.clone()),
+            None => r.call(),
+        }
+        .map_err(err)?;
         resp.into_json().map_err(|e| e.to_string())
     }
 }
@@ -230,8 +271,13 @@ fn read_key(path: &str) -> Option<String> {
 }
 
 fn healthy(base: &str) -> bool {
-    ureq::get(&format!("{base}/health")).timeout(Duration::from_secs(5)).call()
-        .ok().and_then(|r| r.into_string().ok()).map(|s| s.contains("\"healthy\"")).unwrap_or(false)
+    ureq::get(&format!("{base}/health"))
+        .timeout(Duration::from_secs(5))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok())
+        .map(|s| s.contains("\"healthy\""))
+        .unwrap_or(false)
 }
 
 fn listening(addr: &str, port: u16) -> bool {
@@ -250,11 +296,25 @@ fn local_has_addr(addr: &str) -> bool {
 fn peer_status(cfg: &Config) -> Option<Status> {
     for ip in [&cfg.peer.bridge_ip, &cfg.peer.rdma_ip] {
         let target = format!("{}@{}", cfg.peer.ssh_user, ip);
-        let (ok, out) = net::run("/usr/bin/ssh", &[
-            "-i", &expand(&cfg.ssh_key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=accept-new",
-            &target, &cfg.peer_tblink, "status", "--json",
-        ]);
+        let (ok, out) = net::run(
+            "/usr/bin/ssh",
+            &[
+                "-i",
+                &expand(&cfg.ssh_key),
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                &target,
+                &cfg.peer_tblink,
+                "status",
+                "--json",
+            ],
+        );
         if ok {
             if let Ok(s) = serde_json::from_str::<Status>(out.trim()) {
                 return Some(s);
@@ -306,15 +366,22 @@ impl State {
 }
 
 pub fn main(config_path: &str, once: bool, check: bool) -> i32 {
-    let cfg: Config = match std::fs::read_to_string(expand(config_path)).map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
+    let cfg: Config = match std::fs::read_to_string(expand(config_path))
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
         Ok(c) => c,
-        Err(e) => { eprintln!("cannot read {config_path}: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("cannot read {config_path}: {e}");
+            return 1;
+        }
     };
     if check {
         // Validate without changing anything: config, key, API, peer.
         let problems = config_problems(&cfg, read_key(&cfg.settings_path).is_some());
-        for p in &problems { eprintln!("{p}"); }
+        for p in &problems {
+            eprintln!("{p}");
+        }
         println!("oMLX at {}: {}", cfg.api, if healthy(&cfg.api) { "healthy" } else { "not answering" });
         match peer_status(&cfg) {
             Some(p) => println!("peer {}: active port {}", p.hostname, p.active.map(|a| a.name).unwrap_or("none".into())),
@@ -331,7 +398,9 @@ pub fn main(config_path: &str, once: bool, check: bool) -> i32 {
         } else {
             tick(&cfg, &mut st);
         }
-        if once { return 0; }
+        if once {
+            return 0;
+        }
         sleep_secs(cfg.interval_secs);
     }
 }
@@ -349,7 +418,10 @@ pub fn marker_path(config_path: &str) -> std::path::PathBuf {
 /// Live deployments to unload on shutdown: this model's, if live.
 pub fn to_unload(deps: &Value, status: &Value, model: &str) -> Vec<String> {
     let live = live_ids(status);
-    deps["deployments"].as_array().into_iter().flatten()
+    deps["deployments"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter(|d| d["model"].as_str() == Some(model))
         .filter_map(|d| d["deployment_id"].as_str().map(str::to_string))
         .filter(|id| live.contains(id))
@@ -358,10 +430,15 @@ pub fn to_unload(deps: &Value, status: &Value, model: &str) -> Vec<String> {
 
 /// `tblink shutdown`: pause the coordinator, unload the deployment, stop oMLX.
 pub fn shutdown(config_path: &str) -> i32 {
-    let cfg: Config = match std::fs::read_to_string(expand(config_path)).map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
+    let cfg: Config = match std::fs::read_to_string(expand(config_path))
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
         Ok(c) => c,
-        Err(e) => { eprintln!("cannot read {config_path}: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("cannot read {config_path}: {e}");
+            return 1;
+        }
     };
     let marker = marker_path(config_path);
     if let Err(e) = std::fs::write(&marker, format!("paused by tblink shutdown at {}\n", crate::now_string())) {
@@ -421,11 +498,15 @@ pub fn resume(config_path: &str) -> i32 {
 }
 
 fn brew(cfg: &Config, verb: &str, st: &mut State, why: &str) {
-    if !State::due(st.last_service, cfg.backoff_secs) { return; }
+    if !State::due(st.last_service, cfg.backoff_secs) {
+        return;
+    }
     st.last_service = Some(Instant::now());
     log(&format!("{why}; brew services {verb} {}", cfg.service));
     let (ok, out) = net::run(&cfg.brew, &["services", verb, &cfg.service]);
-    if !ok { log(&format!("brew services {verb} failed: {}", out.trim())); }
+    if !ok {
+        log(&format!("brew services {verb} failed: {}", out.trim()));
+    }
 }
 
 fn tick(cfg: &Config, st: &mut State) {
@@ -440,12 +521,18 @@ fn tick(cfg: &Config, st: &mut State) {
         brew(cfg, "restart", st, &format!("{miss} is configured and present but oMLX is not listening on it"));
         return;
     }
-    let Some(key) = read_key(&cfg.settings_path) else { st.note("cannot read the oMLX API key".into()); return };
+    let Some(key) = read_key(&cfg.settings_path) else {
+        st.note("cannot read the oMLX API key".into());
+        return;
+    };
     let api = Api { base: cfg.api.clone(), key };
 
     // 3. Port state on both Macs.
     let local = net::status();
-    let Some(peer) = peer_status(cfg) else { st.note("peer unreachable over SSH; waiting".into()); return };
+    let Some(peer) = peer_status(cfg) else {
+        st.note("peer unreachable over SSH; waiting".into());
+        return;
+    };
 
     let backend = choose_backend(cfg, &local, &peer, st.ring_hold());
     let want_hosts = desired_hosts(cfg, &backend, &local, &peer);
@@ -453,22 +540,42 @@ fn tick(cfg: &Config, st: &mut State) {
 
     // 4. Current deployment for this model, and whether it is live.
     let model = cfg.plan_request["model_path"].as_str().unwrap_or_default();
-    let deps = match api.get("/admin/api/cluster/deployments") { Ok(v) => v, Err(e) => { st.note(format!("deployments: {e}")); return } };
+    let deps = match api.get("/admin/api/cluster/deployments") {
+        Ok(v) => v,
+        Err(e) => {
+            st.note(format!("deployments: {e}"));
+            return;
+        }
+    };
     let current = current_deployment(&deps, model);
-    let status = match api.get("/admin/api/cluster/status") { Ok(v) => v, Err(e) => { st.note(format!("status: {e}")); return } };
+    let status = match api.get("/admin/api/cluster/status") {
+        Ok(v) => v,
+        Err(e) => {
+            st.note(format!("status: {e}"));
+            return;
+        }
+    };
     let live = live_ids(&status);
 
     let decision = decide(&backend, &want_hosts, current.as_ref(), &live);
     if let Decision::Live(cur_id) = &decision {
-        if let Some(t) = st.down_since.take() { log(&format!("{cur_id} live again (down {} s)", t.elapsed().as_secs())); }
-        if backend == Backend::Jaccl { st.jaccl_failures = 0; }
-        st.note(format!("ok: {cur_id} live on {backend_name} ({} ↔ {})",
+        if let Some(t) = st.down_since.take() {
+            log(&format!("{cur_id} live again (down {} s)", t.elapsed().as_secs()));
+        }
+        if backend == Backend::Jaccl {
+            st.jaccl_failures = 0;
+        }
+        st.note(format!(
+            "ok: {cur_id} live on {backend_name} ({} ↔ {})",
             local.active.as_ref().map(|p| p.rdma_device.as_str()).unwrap_or("-"),
-            peer.active.as_ref().map(|p| p.rdma_device.as_str()).unwrap_or("-")));
+            peer.active.as_ref().map(|p| p.rdma_device.as_str()).unwrap_or("-")
+        ));
         return;
     }
     st.down_since.get_or_insert_with(Instant::now);
-    if !State::due(st.last_load, cfg.backoff_secs) { return; }
+    if !State::due(st.last_load, cfg.backoff_secs) {
+        return;
+    }
     st.last_load = Some(Instant::now());
 
     // 5. Rebuild when the ports (or backend) changed.
@@ -476,18 +583,33 @@ fn tick(cfg: &Config, st: &mut State) {
         Decision::Live(_) => unreachable!(),
         Decision::Load(id) => id,
         Decision::Rebuild { previous, unload } => {
-            log(&format!("ports call for {backend_name} with hosts {want_hosts}; rebuilding (was {})", if previous.is_empty() { "none" } else { &previous }));
+            log(&format!(
+                "ports call for {backend_name} with hosts {want_hosts}; rebuilding (was {})",
+                if previous.is_empty() { "none" } else { &previous }
+            ));
             for live in &unload {
                 match api.post(&format!("/admin/api/cluster/deployments/{live}/unload"), None, 300) {
                     Ok(_) => log(&format!("unloaded {live}")),
-                    Err(e) => { log(&format!("unload {live}: {e}")); return; }
+                    Err(e) => {
+                        log(&format!("unload {live}: {e}"));
+                        return;
+                    }
                 }
             }
-            let plan = match api.post("/admin/api/cluster/plan", Some(&cfg.plan_request), 180) { Ok(v) => v, Err(e) => { log(&format!("plan: {e}")); return } };
+            let plan = match api.post("/admin/api/cluster/plan", Some(&cfg.plan_request), 180) {
+                Ok(v) => v,
+                Err(e) => {
+                    log(&format!("plan: {e}"));
+                    return;
+                }
+            };
             let body = deployment_body(&cfg.plan_request, &backend, &plan, &want_hosts);
             match api.post("/admin/api/cluster/deployments", Some(&body), 300) {
                 Ok(v) => v["deployment"]["deployment_id"].as_str().unwrap_or_default().to_string(),
-                Err(e) => { log(&format!("create deployment: {e}")); return; }
+                Err(e) => {
+                    log(&format!("create deployment: {e}"));
+                    return;
+                }
             }
         }
     };
@@ -497,7 +619,10 @@ fn tick(cfg: &Config, st: &mut State) {
     match api.post(&format!("/admin/api/cluster/deployments/{id}/load"), None, 900) {
         Ok(v) if load_ok(&v) => log(&format!("loaded {id} on {backend_name} in {} s", t0.elapsed().as_secs())),
         r => {
-            let why = match r { Ok(v) => v.to_string().chars().take(300).collect(), Err(e) => e };
+            let why = match r {
+                Ok(v) => v.to_string().chars().take(300).collect(),
+                Err(e) => e,
+            };
             log(&format!("load {id} on {backend_name} failed after {} s: {why}", t0.elapsed().as_secs()));
             if backend == Backend::Jaccl && st.record_jaccl_failure(cfg) {
                 log(&format!("JACCL failed {} times; falling back to Ring for {} s", cfg.jaccl_failures_before_ring, cfg.jaccl_retry_secs));
@@ -518,16 +643,25 @@ mod tests {
             "local": {"node_id": "A", "rdma_ip": "10.0.1.1", "bridge_ip": "10.77.0.1"},
             "peer": {"node_id": "B", "rdma_ip": "10.0.1.2", "bridge_ip": "10.77.0.2", "ssh_user": "peeruser"},
             "plan_request": {"model_path": "/m"}
-        })).unwrap()
+        }))
+        .unwrap()
     }
     fn status(dev: &str, inet: &[&str]) -> Status {
-        let p = Port { name: dev.trim_start_matches("rdma_").into(), rdma_device: dev.into(), active: true, bridge_member: false, inet: inet.iter().map(|s| s.to_string()).collect() };
+        let p = Port {
+            name: dev.trim_start_matches("rdma_").into(),
+            rdma_device: dev.into(),
+            active: true,
+            bridge_member: false,
+            inet: inet.iter().map(|s| s.to_string()).collect(),
+        };
         Status { hostname: "h".into(), active: Some(p.clone()), ports: vec![p], bridge_inet: vec![], bridge_members: vec![] }
     }
     fn unplugged() -> Status {
         Status { hostname: "h".into(), active: None, ports: vec![], bridge_inet: vec![], bridge_members: vec![] }
     }
-    fn ids(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
     fn jaccl_pair() -> (Status, Status) {
         (status("rdma_en6", &["10.0.1.1", "10.77.0.1"]), status("rdma_en1", &["10.0.1.2", "10.77.0.2"]))
     }
@@ -550,7 +684,8 @@ mod tests {
             "local": {"node_id": "A", "rdma_ip": "1", "bridge_ip": "2"},
             "peer": {"node_id": "B", "rdma_ip": "3", "bridge_ip": "4"},
             "plan_request": {},
-        })).unwrap();
+        }))
+        .unwrap();
         for (k, n) in [("interval_secs", 5), ("backoff_secs", 30), ("jaccl_retry_secs", 60), ("jaccl_failures_before_ring", 1)] {
             v[k] = json!(n);
         }
@@ -567,7 +702,8 @@ mod tests {
                 "local": {"node_id": "A", "rdma_ip": "1", "bridge_ip": "2"},
                 "peer": {"node_id": "B", "rdma_ip": "3", "bridge_ip": "4"},
                 "plan_request": {},
-            })).unwrap();
+            }))
+            .unwrap();
             v.as_object_mut().unwrap().remove(missing);
             assert!(serde_json::from_value::<Config>(v).is_err(), "{missing} should be required");
         }
@@ -654,20 +790,26 @@ mod tests {
     fn jaccl_hosts_follow_the_active_ports() {
         let c = cfg();
         let h = desired_hosts(&c, &Backend::Jaccl, &status("rdma_en6", &["10.0.1.1"]), &status("rdma_en1", &["10.0.1.2"]));
-        assert_eq!(h, json!([
-            {"node_id": "A", "ssh": "127.0.0.1", "ips": ["10.0.1.1"], "rdma": [null, "rdma_en6"]},
-            {"node_id": "B", "ssh": "peeruser@10.77.0.2", "ips": ["10.0.1.2"], "rdma": ["rdma_en1", null]},
-        ]));
+        assert_eq!(
+            h,
+            json!([
+                {"node_id": "A", "ssh": "127.0.0.1", "ips": ["10.0.1.1"], "rdma": [null, "rdma_en6"]},
+                {"node_id": "B", "ssh": "peeruser@10.77.0.2", "ips": ["10.0.1.2"], "rdma": ["rdma_en1", null]},
+            ])
+        );
     }
 
     #[test]
     fn ring_hosts_use_bridge_addresses_and_no_rdma() {
         let c = cfg();
         let h = desired_hosts(&c, &Backend::Ring, &unplugged(), &unplugged());
-        assert_eq!(h, json!([
-            {"node_id": "A", "ssh": "127.0.0.1", "ips": ["10.77.0.1"], "rdma": []},
-            {"node_id": "B", "ssh": "peeruser@10.77.0.2", "ips": ["10.77.0.2"], "rdma": []},
-        ]));
+        assert_eq!(
+            h,
+            json!([
+                {"node_id": "A", "ssh": "127.0.0.1", "ips": ["10.77.0.1"], "rdma": []},
+                {"node_id": "B", "ssh": "peeruser@10.77.0.2", "ips": ["10.77.0.2"], "rdma": []},
+            ])
+        );
     }
 
     #[test]
@@ -892,7 +1034,10 @@ mod tests {
         let (l, p) = jaccl_pair();
         let old = stored("d1", &Backend::Jaccl, &desired_hosts(&c, &Backend::Jaccl, &status("rdma_en1", &[]), &p));
         let want = desired_hosts(&c, &Backend::Jaccl, &l, &p);
-        assert_eq!(decide(&Backend::Jaccl, &want, Some(&old), &ids(&["d1"])), Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) });
+        assert_eq!(
+            decide(&Backend::Jaccl, &want, Some(&old), &ids(&["d1"])),
+            Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) }
+        );
     }
 
     #[test]
@@ -910,14 +1055,20 @@ mod tests {
         let (l, p) = jaccl_pair();
         let want = desired_hosts(&c, &Backend::Jaccl, &l, &p);
         let old = stored("d1", &Backend::Ring, &desired_hosts(&c, &Backend::Ring, &l, &p));
-        assert_eq!(decide(&Backend::Jaccl, &want, Some(&old), &ids(&["other-model", "d1"])), Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) });
+        assert_eq!(
+            decide(&Backend::Jaccl, &want, Some(&old), &ids(&["other-model", "d1"])),
+            Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) }
+        );
     }
 
     #[test]
     fn decide_rebuild_when_backend_changes_even_if_hosts_match() {
         let want = json!([{"node_id": "A", "ssh": "s", "ips": ["1"], "rdma": []}]);
         let cur = json!({"deployment_id": "d1", "backend": "ring", "hosts": want});
-        assert_eq!(decide(&Backend::Jaccl, &want, Some(&cur), &ids(&["d1"])), Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) });
+        assert_eq!(
+            decide(&Backend::Jaccl, &want, Some(&cur), &ids(&["d1"])),
+            Decision::Rebuild { previous: "d1".into(), unload: ids(&["d1"]) }
+        );
     }
 
     #[test]
@@ -933,7 +1084,10 @@ mod tests {
         let (l, p) = jaccl_pair();
         let cur = stored("j1", &Backend::Jaccl, &desired_hosts(&c, &Backend::Jaccl, &l, &p));
         let want = desired_hosts(&c, &Backend::Ring, &l, &p);
-        assert_eq!(decide(&Backend::Ring, &want, Some(&cur), &ids(&["j1"])), Decision::Rebuild { previous: "j1".into(), unload: ids(&["j1"]) });
+        assert_eq!(
+            decide(&Backend::Ring, &want, Some(&cur), &ids(&["j1"])),
+            Decision::Rebuild { previous: "j1".into(), unload: ids(&["j1"]) }
+        );
     }
 
     #[test]
@@ -950,10 +1104,13 @@ mod tests {
         let req = json!({"model_path": "/m", "tensor_parallel_size": 2, "target_context_tokens": 32768});
         let plan = json!({"placement_signature": "sig-1", "other": 1});
         let hosts = json!([{"node_id": "A"}]);
-        assert_eq!(deployment_body(&req, &Backend::Jaccl, &plan, &hosts), json!({
-            "model_path": "/m", "tensor_parallel_size": 2, "target_context_tokens": 32768,
-            "backend": "jaccl", "auto_tune": true, "approved_placement": "sig-1", "hosts": [{"node_id": "A"}],
-        }));
+        assert_eq!(
+            deployment_body(&req, &Backend::Jaccl, &plan, &hosts),
+            json!({
+                "model_path": "/m", "tensor_parallel_size": 2, "target_context_tokens": 32768,
+                "backend": "jaccl", "auto_tune": true, "approved_placement": "sig-1", "hosts": [{"node_id": "A"}],
+            })
+        );
     }
 
     #[test]

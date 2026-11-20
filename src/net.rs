@@ -31,10 +31,7 @@ pub struct Status {
 
 impl Status {
     pub fn active_has(&self, addr: &str) -> bool {
-        self.active
-            .as_ref()
-            .map(|p| p.inet.iter().any(|a| a == addr))
-            .unwrap_or(false)
+        self.active.as_ref().map(|p| p.inet.iter().any(|a| a == addr)).unwrap_or(false)
     }
 }
 
@@ -76,17 +73,12 @@ pub fn parse_members(bridge_ifconfig: &str) -> Vec<String> {
 
 /// `ibv_devices` rows look like `    rdma_en1     a067dd5dad30ac05`.
 pub fn parse_rdma_devices(out: &str) -> Vec<String> {
-    out.lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|w| w.starts_with("rdma_"))
-        .map(str::to_string)
-        .collect()
+    out.lines().filter_map(|l| l.split_whitespace().next()).filter(|w| w.starts_with("rdma_")).map(str::to_string).collect()
 }
 
 /// The `interface:` line of `route -n get` output.
 pub fn parse_route_interface(out: &str) -> Option<String> {
-    out.lines()
-        .find_map(|l| l.trim().strip_prefix("interface:").map(|s| s.trim().to_string()))
+    out.lines().find_map(|l| l.trim().strip_prefix("interface:").map(|s| s.trim().to_string()))
 }
 
 pub fn ifconfig(name: &str) -> String {
@@ -102,24 +94,12 @@ pub fn build_status(hostname: &str, ibv_out: &str, bridge_out: &str, ifconfig_of
         .map(|dev| {
             let name = dev.trim_start_matches("rdma_").to_string();
             let out = ifconfig_of(&name);
-            Port {
-                bridge_member: members.contains(&name),
-                active: parse_active(&out),
-                inet: parse_inet(&out),
-                rdma_device: dev,
-                name,
-            }
+            Port { bridge_member: members.contains(&name), active: parse_active(&out), inet: parse_inet(&out), rdma_device: dev, name }
         })
         .collect();
     ports.sort_by(|a, b| a.name.cmp(&b.name));
     let active = ports.iter().find(|p| p.active).cloned();
-    Status {
-        hostname: hostname.trim().to_string(),
-        active,
-        ports,
-        bridge_inet: parse_inet(bridge_out),
-        bridge_members: members,
-    }
+    Status { hostname: hostname.trim().to_string(), active, ports, bridge_inet: parse_inet(bridge_out), bridge_members: members }
 }
 
 pub fn status() -> Status {
@@ -148,7 +128,13 @@ mod tests {
     const IBV: &str = "    device          \t   node GUID\n    ------          \t----------------\n    rdma_en1        \ta067dd5dad30ac05\n    rdma_en6        \ta167dd5dad30ac05\n";
 
     fn port(name: &str, active: bool, member: bool, inet: &[&str]) -> Port {
-        Port { name: name.into(), rdma_device: format!("rdma_{name}"), active, bridge_member: member, inet: inet.iter().map(|s| s.to_string()).collect() }
+        Port {
+            name: name.into(),
+            rdma_device: format!("rdma_{name}"),
+            active,
+            bridge_member: member,
+            inet: inet.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     // ---- parse_inet ----
@@ -254,7 +240,8 @@ mod tests {
 
     #[test]
     fn route_interface_from_route_get() {
-        let out = "   route to: 10.0.1.1\ndestination: 10.0.1.0\n       mask: 255.255.255.0\n  interface: en1\n      flags: <UP,DONE,CLONING>\n";
+        let out =
+            "   route to: 10.0.1.1\ndestination: 10.0.1.0\n       mask: 255.255.255.0\n  interface: en1\n      flags: <UP,DONE,CLONING>\n";
         assert_eq!(parse_route_interface(out), Some("en1".into()));
     }
 
@@ -325,7 +312,10 @@ mod tests {
     fn status_only_queries_rdma_capable_ports() {
         use std::cell::RefCell;
         let asked = RefCell::new(Vec::new());
-        build_status("h", IBV, BR, &|n| { asked.borrow_mut().push(n.to_string()); String::new() });
+        build_status("h", IBV, BR, &|n| {
+            asked.borrow_mut().push(n.to_string());
+            String::new()
+        });
         assert_eq!(*asked.borrow(), vec!["en1", "en6"]);
     }
 
@@ -364,7 +354,13 @@ mod tests {
 
     #[test]
     fn status_json_field_names_are_stable() {
-        let s = Status { hostname: "h".into(), active: Some(port("en1", true, false, &["10.0.1.2"])), ports: vec![], bridge_inet: vec![], bridge_members: vec![] };
+        let s = Status {
+            hostname: "h".into(),
+            active: Some(port("en1", true, false, &["10.0.1.2"])),
+            ports: vec![],
+            bridge_inet: vec![],
+            bridge_members: vec![],
+        };
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
         for k in ["hostname", "active", "ports", "bridge_inet", "bridge_members"] {
             assert!(v.get(k).is_some(), "missing {k}");

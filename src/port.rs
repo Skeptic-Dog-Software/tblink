@@ -68,7 +68,11 @@ pub fn plan(st: &Status, a: &PortArgs, routes: &dyn Fn(&str) -> Option<String>) 
     let mut added_nets = Vec::new();
     for addr in &ours {
         if !active.inet.iter().any(|x| x == addr) {
-            out.push(act(IFCONFIG, &[&active.name, "inet", addr, "netmask", "255.255.255.0", "alias"], format!("add {addr} to {}", active.name)));
+            out.push(act(
+                IFCONFIG,
+                &[&active.name, "inet", addr, "netmask", "255.255.255.0", "alias"],
+                format!("add {addr} to {}", active.name),
+            ));
             added_nets.push(subnet24(addr));
         }
     }
@@ -79,7 +83,11 @@ pub fn plan(st: &Status, a: &PortArgs, routes: &dyn Fn(&str) -> Option<String>) 
             other => {
                 let net = subnet24(peer);
                 if other.is_some() {
-                    out.push(act(ROUTE, &["-n", "delete", "-net", &net], format!("route to {peer} uses {}", other.as_deref().unwrap_or("?"))));
+                    out.push(act(
+                        ROUTE,
+                        &["-n", "delete", "-net", &net],
+                        format!("route to {peer} uses {}", other.as_deref().unwrap_or("?")),
+                    ));
                 }
                 out.push(act(ROUTE, &["-n", "add", "-net", &net, "-interface", &active.name], format!("route {net} via {}", active.name)));
             }
@@ -114,8 +122,14 @@ pub fn apply(actions: &[Action], dry_run: bool, runner: &mut Runner) -> Vec<Stri
             }
             let args: Vec<&str> = x.args.iter().map(String::as_str).collect();
             let (ok, out) = runner(x.cmd, &args);
-            format!("{} {}: {}  ({}){}", x.cmd, x.args.join(" "), if ok { "ok" } else { "FAILED" }, x.why,
-                if ok { String::new() } else { format!(": {}", out.trim()) })
+            format!(
+                "{} {}: {}  ({}){}",
+                x.cmd,
+                x.args.join(" "),
+                if ok { "ok" } else { "FAILED" },
+                x.why,
+                if ok { String::new() } else { format!(": {}", out.trim()) }
+            )
         })
         .collect()
 }
@@ -160,16 +174,35 @@ mod tests {
     use std::cell::RefCell;
 
     fn port(name: &str, active: bool, member: bool, inet: &[&str]) -> Port {
-        Port { name: name.into(), rdma_device: format!("rdma_{name}"), active, bridge_member: member, inet: inet.iter().map(|s| s.to_string()).collect() }
+        Port {
+            name: name.into(),
+            rdma_device: format!("rdma_{name}"),
+            active,
+            bridge_member: member,
+            inet: inet.iter().map(|s| s.to_string()).collect(),
+        }
     }
     fn args() -> PortArgs {
-        PortArgs { rdma_ip: "10.0.1.1".into(), bridge_ip: Some("10.77.0.1".into()), peer_ips: vec!["10.0.1.2".into()], interval: 5, once: true, dry_run: true }
+        PortArgs {
+            rdma_ip: "10.0.1.1".into(),
+            bridge_ip: Some("10.77.0.1".into()),
+            peer_ips: vec!["10.0.1.2".into()],
+            interval: 5,
+            once: true,
+            dry_run: true,
+        }
     }
     fn args_peers(peers: &[&str]) -> PortArgs {
         PortArgs { peer_ips: peers.iter().map(|s| s.to_string()).collect(), ..args() }
     }
     fn st(ports: Vec<Port>, bridge_inet: &[&str]) -> Status {
-        Status { hostname: "t".into(), active: ports.iter().find(|p| p.active).cloned(), bridge_members: ports.iter().filter(|p| p.bridge_member).map(|p| p.name.clone()).collect(), ports, bridge_inet: bridge_inet.iter().map(|s| s.to_string()).collect() }
+        Status {
+            hostname: "t".into(),
+            active: ports.iter().find(|p| p.active).cloned(),
+            bridge_members: ports.iter().filter(|p| p.bridge_member).map(|p| p.name.clone()).collect(),
+            ports,
+            bridge_inet: bridge_inet.iter().map(|s| s.to_string()).collect(),
+        }
     }
     fn cmds(v: &[Action]) -> Vec<String> {
         v.iter().map(|a| a.args.join(" ")).collect()
@@ -204,21 +237,24 @@ mod tests {
         // Observed after a cable move: address left on en1, cable now on en6, en6 in the bridge.
         let s = st(vec![port("en1", false, true, &["10.0.1.1"]), port("en6", true, true, &[])], &["10.77.0.1"]);
         let v = plan(&s, &args(), &routes_via("en1"));
-        assert_eq!(cmds(&v), vec![
-            "en1 inet 10.0.1.1 -alias",
-            "bridge0 deletem en6",
-            "bridge0 inet 10.77.0.1 -alias",
-            "en6 inet 10.0.1.1 netmask 255.255.255.0 alias",
-            "en6 inet 10.77.0.1 netmask 255.255.255.0 alias",
-        ]);
+        assert_eq!(
+            cmds(&v),
+            vec![
+                "en1 inet 10.0.1.1 -alias",
+                "bridge0 deletem en6",
+                "bridge0 inet 10.77.0.1 -alias",
+                "en6 inet 10.0.1.1 netmask 255.255.255.0 alias",
+                "en6 inet 10.77.0.1 netmask 255.255.255.0 alias",
+            ]
+        );
     }
 
     #[test]
     fn stale_route_is_replaced() {
-        assert_eq!(cmds(&plan(&settled(), &args(), &routes_via("en1"))), vec![
-            "-n delete -net 10.0.1.0/24",
-            "-n add -net 10.0.1.0/24 -interface en6",
-        ]);
+        assert_eq!(
+            cmds(&plan(&settled(), &args(), &routes_via("en1"))),
+            vec!["-n delete -net 10.0.1.0/24", "-n add -net 10.0.1.0/24 -interface en6",]
+        );
     }
 
     #[test]
@@ -254,11 +290,10 @@ mod tests {
     fn fresh_boot_with_port_in_bridge() {
         // After a reboot: no addresses anywhere, active port still a bridge member.
         let s = st(vec![port("en1", true, true, &[]), port("en2", false, true, &[])], &[]);
-        assert_eq!(cmds(&plan(&s, &args(), &|_| None)), vec![
-            "bridge0 deletem en1",
-            "en1 inet 10.0.1.1 netmask 255.255.255.0 alias",
-            "en1 inet 10.77.0.1 netmask 255.255.255.0 alias",
-        ]);
+        assert_eq!(
+            cmds(&plan(&s, &args(), &|_| None)),
+            vec!["bridge0 deletem en1", "en1 inet 10.0.1.1 netmask 255.255.255.0 alias", "en1 inet 10.77.0.1 netmask 255.255.255.0 alias",]
+        );
     }
 
     // ---- plan: stale addresses ----
@@ -266,32 +301,32 @@ mod tests {
     #[test]
     fn both_addresses_stale_on_one_inactive_port() {
         let s = st(vec![port("en1", false, false, &["10.0.1.1", "10.77.0.1"]), port("en6", true, false, &["10.0.1.1", "10.77.0.1"])], &[]);
-        assert_eq!(cmds(&plan(&s, &args(), &routes_via("en6"))), vec![
-            "en1 inet 10.0.1.1 -alias",
-            "en1 inet 10.77.0.1 -alias",
-        ]);
+        assert_eq!(cmds(&plan(&s, &args(), &routes_via("en6"))), vec!["en1 inet 10.0.1.1 -alias", "en1 inet 10.77.0.1 -alias",]);
     }
 
     #[test]
     fn stale_copies_on_several_inactive_ports_are_all_removed() {
-        let s = st(vec![
-            port("en1", false, false, &["10.0.1.1"]),
-            port("en2", false, false, &["10.77.0.1"]),
-            port("en6", true, false, &["10.0.1.1", "10.77.0.1"]),
-        ], &[]);
-        assert_eq!(cmds(&plan(&s, &args(), &routes_via("en6"))), vec![
-            "en1 inet 10.0.1.1 -alias",
-            "en2 inet 10.77.0.1 -alias",
-        ]);
+        let s = st(
+            vec![
+                port("en1", false, false, &["10.0.1.1"]),
+                port("en2", false, false, &["10.77.0.1"]),
+                port("en6", true, false, &["10.0.1.1", "10.77.0.1"]),
+            ],
+            &[],
+        );
+        assert_eq!(cmds(&plan(&s, &args(), &routes_via("en6"))), vec!["en1 inet 10.0.1.1 -alias", "en2 inet 10.77.0.1 -alias",]);
     }
 
     #[test]
     fn unrelated_addresses_are_never_touched() {
         // Only this Mac's two configured addresses are managed; anything else stays.
-        let s = st(vec![
-            port("en1", false, false, &["10.0.1.2", "169.254.4.123"]),
-            port("en6", true, false, &["10.0.1.1", "10.77.0.1", "192.168.50.9"]),
-        ], &["10.77.0.2"]);
+        let s = st(
+            vec![
+                port("en1", false, false, &["10.0.1.2", "169.254.4.123"]),
+                port("en6", true, false, &["10.0.1.1", "10.77.0.1", "192.168.50.9"]),
+            ],
+            &["10.77.0.2"],
+        );
         assert!(plan(&s, &args(), &routes_via("en6")).is_empty());
     }
 
@@ -315,7 +350,10 @@ mod tests {
 
     #[test]
     fn inactive_bridge_members_are_left_in_the_bridge() {
-        let s = st(vec![port("en1", false, true, &[]), port("en2", false, true, &[]), port("en6", true, false, &["10.0.1.1", "10.77.0.1"])], &[]);
+        let s = st(
+            vec![port("en1", false, true, &[]), port("en2", false, true, &[]), port("en6", true, false, &["10.0.1.1", "10.77.0.1"])],
+            &[],
+        );
         assert!(plan(&s, &args(), &routes_via("en6")).is_empty());
     }
 
@@ -380,7 +418,10 @@ mod tests {
         // Adding 10.0.1.1 installs 10.0.1.0/24; checking the route now would read stale state.
         let s = st(vec![port("en6", true, false, &["10.77.0.1"])], &[]);
         let asked = RefCell::new(Vec::new());
-        let v = plan(&s, &args(), &|p| { asked.borrow_mut().push(p.to_string()); Some("en1".into()) });
+        let v = plan(&s, &args(), &|p| {
+            asked.borrow_mut().push(p.to_string());
+            Some("en1".into())
+        });
         assert!(asked.borrow().is_empty());
         assert_eq!(cmds(&v), vec!["en6 inet 10.0.1.1 netmask 255.255.255.0 alias"]);
     }
@@ -389,22 +430,22 @@ mod tests {
     fn routes_for_each_peer_subnet() {
         let a = args_peers(&["10.0.1.2", "10.77.0.2"]);
         let v = plan(&settled(), &a, &routes_via("bridge0"));
-        assert_eq!(cmds(&v), vec![
-            "-n delete -net 10.0.1.0/24",
-            "-n add -net 10.0.1.0/24 -interface en6",
-            "-n delete -net 10.77.0.0/24",
-            "-n add -net 10.77.0.0/24 -interface en6",
-        ]);
+        assert_eq!(
+            cmds(&v),
+            vec![
+                "-n delete -net 10.0.1.0/24",
+                "-n add -net 10.0.1.0/24 -interface en6",
+                "-n delete -net 10.77.0.0/24",
+                "-n add -net 10.77.0.0/24 -interface en6",
+            ]
+        );
     }
 
     #[test]
     fn only_the_wrong_route_is_fixed() {
         let a = args_peers(&["10.0.1.2", "10.77.0.2"]);
         let routes = |p: &str| Some(if p.starts_with("10.0.1.") { "en6" } else { "en9" }.to_string());
-        assert_eq!(cmds(&plan(&settled(), &a, &routes)), vec![
-            "-n delete -net 10.77.0.0/24",
-            "-n add -net 10.77.0.0/24 -interface en6",
-        ]);
+        assert_eq!(cmds(&plan(&settled(), &a, &routes)), vec!["-n delete -net 10.77.0.0/24", "-n add -net 10.77.0.0/24 -interface en6",]);
     }
 
     #[test]
@@ -419,7 +460,11 @@ mod tests {
     fn no_peers_means_no_route_work() {
         let a = args_peers(&[]);
         let asked = RefCell::new(0);
-        assert!(plan(&settled(), &a, &|_| { *asked.borrow_mut() += 1; Some("en1".into()) }).is_empty());
+        assert!(plan(&settled(), &a, &|_| {
+            *asked.borrow_mut() += 1;
+            Some("en1".into())
+        })
+        .is_empty());
         assert_eq!(*asked.borrow(), 0);
     }
 
@@ -427,7 +472,10 @@ mod tests {
     fn route_is_looked_up_per_peer_address() {
         let a = args_peers(&["10.0.1.2", "10.77.0.2"]);
         let asked = RefCell::new(Vec::new());
-        plan(&settled(), &a, &|p| { asked.borrow_mut().push(p.to_string()); Some("en6".into()) });
+        plan(&settled(), &a, &|p| {
+            asked.borrow_mut().push(p.to_string());
+            Some("en6".into())
+        });
         assert_eq!(*asked.borrow(), vec!["10.0.1.2", "10.77.0.2"]);
     }
 
@@ -437,7 +485,10 @@ mod tests {
         let a = args_peers(&["10.0.1.2", "10.77.0.2"]);
         let s = st(vec![port("en6", true, false, &["10.0.1.1"])], &[]);
         let asked = RefCell::new(Vec::new());
-        plan(&s, &a, &|p| { asked.borrow_mut().push(p.to_string()); Some("en6".into()) });
+        plan(&s, &a, &|p| {
+            asked.borrow_mut().push(p.to_string());
+            Some("en6".into())
+        });
         assert_eq!(*asked.borrow(), vec!["10.0.1.2"]);
     }
 
@@ -449,14 +500,17 @@ mod tests {
         let a = args_peers(&["10.0.1.2", "10.77.0.2"]);
         let s = st(vec![port("en1", false, true, &["10.0.1.1"]), port("en6", true, true, &["10.77.0.1"])], &["10.77.0.1"]);
         let v = plan(&s, &a, &routes_via("en1"));
-        assert_eq!(cmds(&v), vec![
-            "en1 inet 10.0.1.1 -alias",
-            "bridge0 deletem en6",
-            "bridge0 inet 10.77.0.1 -alias",
-            "en6 inet 10.0.1.1 netmask 255.255.255.0 alias",
-            "-n delete -net 10.77.0.0/24",
-            "-n add -net 10.77.0.0/24 -interface en6",
-        ]);
+        assert_eq!(
+            cmds(&v),
+            vec![
+                "en1 inet 10.0.1.1 -alias",
+                "bridge0 deletem en6",
+                "bridge0 inet 10.77.0.1 -alias",
+                "en6 inet 10.0.1.1 netmask 255.255.255.0 alias",
+                "-n delete -net 10.77.0.0/24",
+                "-n add -net 10.77.0.0/24 -interface en6",
+            ]
+        );
     }
 
     #[test]
@@ -510,22 +564,28 @@ mod tests {
     #[test]
     fn dry_run_never_calls_the_runner() {
         let mut calls = 0;
-        let lines = apply(&two_actions(), true, &mut |_, _| { calls += 1; (true, String::new()) });
+        let lines = apply(&two_actions(), true, &mut |_, _| {
+            calls += 1;
+            (true, String::new())
+        });
         assert_eq!(calls, 0);
-        assert_eq!(lines, vec![
-            "would run: /sbin/ifconfig en1 inet 10.0.1.1 -alias   (stale 10.0.1.1 on inactive en1)",
-            "would run: /sbin/route -n add -net 10.0.1.0/24 -interface en6   (route 10.0.1.0/24 via en6)",
-        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "would run: /sbin/ifconfig en1 inet 10.0.1.1 -alias   (stale 10.0.1.1 on inactive en1)",
+                "would run: /sbin/route -n add -net 10.0.1.0/24 -interface en6   (route 10.0.1.0/24 via en6)",
+            ]
+        );
     }
 
     #[test]
     fn apply_runs_each_command_with_its_arguments() {
         let mut seen = Vec::new();
-        apply(&two_actions(), false, &mut |c, a| { seen.push(format!("{c} {}", a.join(" "))); (true, String::new()) });
-        assert_eq!(seen, vec![
-            "/sbin/ifconfig en1 inet 10.0.1.1 -alias",
-            "/sbin/route -n add -net 10.0.1.0/24 -interface en6",
-        ]);
+        apply(&two_actions(), false, &mut |c, a| {
+            seen.push(format!("{c} {}", a.join(" ")));
+            (true, String::new())
+        });
+        assert_eq!(seen, vec!["/sbin/ifconfig en1 inet 10.0.1.1 -alias", "/sbin/route -n add -net 10.0.1.0/24 -interface en6",]);
     }
 
     #[test]
@@ -536,14 +596,19 @@ mod tests {
 
     #[test]
     fn apply_logs_failure_with_trimmed_output() {
-        let lines = apply(&two_actions()[..1], false, &mut |_, _| (false, "  ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address\n".into()));
+        let lines = apply(&two_actions()[..1], false, &mut |_, _| {
+            (false, "  ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address\n".into())
+        });
         assert_eq!(lines, vec!["/sbin/ifconfig en1 inet 10.0.1.1 -alias: FAILED  (stale 10.0.1.1 on inactive en1): ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address"]);
     }
 
     #[test]
     fn apply_continues_after_a_failure() {
         let mut n = 0;
-        let lines = apply(&two_actions(), false, &mut |_, _| { n += 1; (n != 1, "boom".into()) });
+        let lines = apply(&two_actions(), false, &mut |_, _| {
+            n += 1;
+            (n != 1, "boom".into())
+        });
         assert_eq!(n, 2);
         assert!(lines[0].contains("FAILED"));
         assert!(lines[1].contains(": ok "));

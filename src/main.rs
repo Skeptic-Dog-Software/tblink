@@ -48,19 +48,19 @@ enum Cmd {
 fn parse(args: &[String]) -> Option<Cmd> {
     let flag = |name: &str| args.iter().any(|a| a == name);
     let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let values = |name: &str| -> Vec<String> {
-        args.windows(2).filter(|w| w[0] == name).map(|w| w[1].clone()).collect()
-    };
+    let values = |name: &str| -> Vec<String> { args.windows(2).filter(|w| w[0] == name).map(|w| w[1].clone()).collect() };
     match args.first().map(String::as_str) {
         Some("status") => Some(Cmd::Status { json: flag("--json") }),
-        Some("port") => value("--rdma-ip").map(|rdma_ip| Cmd::Port(port::PortArgs {
-            rdma_ip,
-            bridge_ip: value("--bridge-ip"),
-            peer_ips: values("--peer"),
-            interval: value("--interval").and_then(|s| s.parse().ok()).unwrap_or(5),
-            once: flag("--once"),
-            dry_run: flag("--dry-run"),
-        })),
+        Some("port") => value("--rdma-ip").map(|rdma_ip| {
+            Cmd::Port(port::PortArgs {
+                rdma_ip,
+                bridge_ip: value("--bridge-ip"),
+                peer_ips: values("--peer"),
+                interval: value("--interval").and_then(|s| s.parse().ok()).unwrap_or(5),
+                once: flag("--once"),
+                dry_run: flag("--dry-run"),
+            })
+        }),
         Some("coordinator") => value("--config").map(|config| Cmd::Coordinator { config, once: flag("--once"), check: flag("--check") }),
         Some("shutdown") => Some(Cmd::Shutdown { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
         Some("resume") => Some(Cmd::Resume { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
@@ -84,7 +84,10 @@ fn main() {
         Some(Cmd::Coordinator { config, once, check }) => coord::main(&config, once, check),
         Some(Cmd::Shutdown { config }) => coord::shutdown(&config),
         Some(Cmd::Resume { config }) => coord::resume(&config),
-        None => { eprintln!("{USAGE}"); 2 }
+        None => {
+            eprintln!("{USAGE}");
+            2
+        }
     };
     std::process::exit(code);
 }
@@ -98,7 +101,10 @@ mod tests {
         parse(&v)
     }
     fn port_args(s: &str) -> port::PortArgs {
-        match p(s) { Some(Cmd::Port(a)) => a, other => panic!("expected port, got {other:?}") }
+        match p(s) {
+            Some(Cmd::Port(a)) => a,
+            other => panic!("expected port, got {other:?}"),
+        }
     }
 
     #[test]
@@ -129,18 +135,26 @@ mod tests {
 
     #[test]
     fn port_minimal_uses_defaults() {
-        assert_eq!(port_args("port --rdma-ip 10.0.1.2"), port::PortArgs {
-            rdma_ip: "10.0.1.2".into(), bridge_ip: None, peer_ips: vec![], interval: 5, once: false, dry_run: false,
-        });
+        assert_eq!(
+            port_args("port --rdma-ip 10.0.1.2"),
+            port::PortArgs { rdma_ip: "10.0.1.2".into(), bridge_ip: None, peer_ips: vec![], interval: 5, once: false, dry_run: false }
+        );
     }
 
     #[test]
     fn port_full_install_line() {
         // The exact arguments install.sh writes into the LaunchDaemon.
-        assert_eq!(port_args("port --rdma-ip 10.0.1.1 --bridge-ip 10.77.0.1 --peer 10.0.1.2 --peer 10.77.0.2"), port::PortArgs {
-            rdma_ip: "10.0.1.1".into(), bridge_ip: Some("10.77.0.1".into()),
-            peer_ips: vec!["10.0.1.2".into(), "10.77.0.2".into()], interval: 5, once: false, dry_run: false,
-        });
+        assert_eq!(
+            port_args("port --rdma-ip 10.0.1.1 --bridge-ip 10.77.0.1 --peer 10.0.1.2 --peer 10.77.0.2"),
+            port::PortArgs {
+                rdma_ip: "10.0.1.1".into(),
+                bridge_ip: Some("10.77.0.1".into()),
+                peer_ips: vec!["10.0.1.2".into(), "10.77.0.2".into()],
+                interval: 5,
+                once: false,
+                dry_run: false,
+            }
+        );
     }
 
     #[test]
@@ -189,8 +203,14 @@ mod tests {
     #[test]
     fn coordinator_options() {
         assert_eq!(p("coordinator --config ~/c.json"), Some(Cmd::Coordinator { config: "~/c.json".into(), once: false, check: false }));
-        assert_eq!(p("coordinator --check --config /c.json"), Some(Cmd::Coordinator { config: "/c.json".into(), once: false, check: true }));
-        assert_eq!(p("coordinator --config /c.json --once --check"), Some(Cmd::Coordinator { config: "/c.json".into(), once: true, check: true }));
+        assert_eq!(
+            p("coordinator --check --config /c.json"),
+            Some(Cmd::Coordinator { config: "/c.json".into(), once: false, check: true })
+        );
+        assert_eq!(
+            p("coordinator --config /c.json --once --check"),
+            Some(Cmd::Coordinator { config: "/c.json".into(), once: true, check: true })
+        );
     }
 
     #[test]
