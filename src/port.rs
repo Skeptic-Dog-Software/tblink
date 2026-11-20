@@ -1,20 +1,30 @@
 //! `tblink port`: the per-Mac root daemon.
 //!
 //! Each tick it makes the link look the way the JACCL backend needs it:
-//!   1. the active RDMA-capable Thunderbolt port carries this Mac's RDMA
-//!      address (10.0.1.N/24) and, optionally, its old bridge address
-//!      (10.77.0.N/24) so SSH, Screen Sharing and API clients keep working;
-//!   2. no inactive port still holds either address (a stale copy owns the
+//!   1. it picks the roles of the active RDMA-capable Thunderbolt ports (see
+//!      `roles`): with one cable, that port carries this Mac's RDMA address
+//!      (10.0.1.N/24) and, optionally, its old bridge address (10.77.0.N/24)
+//!      so SSH, Screen Sharing and API clients keep working; with two, the
+//!      fastest carries only the RDMA address and the other the bridge address;
+//!   2. no other port still holds either address (a stale copy owns the
 //!      subnet route and silently breaks the link);
-//!   3. the active port is not a bridge0 member, and bridge0 does not hold
+//!   3. the ports in use are not bridge0 members, and bridge0 does not hold
 //!      the bridge address while its members are gone;
-//!   4. the subnet routes to the peer go out the active port.
+//!   4. the subnet routes to the peer go out the port carrying that subnet.
 //!
-//! It only ever adds or removes these two addresses, removes the active port
-//! from bridge0, and fixes those two routes.
+//! It only ever adds or removes these two addresses, removes the ports in use
+//! from bridge0, and fixes those two routes. With more than one cable it also
+//! checks, with a TCP connect bound to each port, that the peer's addresses
+//! answer where this Mac expects them, and writes what it decided to
+//! `net::STATE_PATH` for `tblink status`.
 
-use crate::net::{self, Status, BRIDGE, IFCONFIG, ROUTE};
+use crate::net::{self, DaemonState, Status, BRIDGE, IFCONFIG, ROUTE};
+use crate::roles::{Controller, Layout, Probe, Tuning};
 use crate::{log, sleep_secs};
+use std::net::Ipv4Addr;
+use std::time::Instant;
+
+pub const NC: &str = "/usr/bin/nc";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PortArgs {
@@ -24,6 +34,8 @@ pub struct PortArgs {
     pub interval: u64,
     pub once: bool,
     pub dry_run: bool,
+    /// TCP port the peer answers on (Remote Login), for the reachability checks.
+    pub probe_port: u16,
 }
 
 /// One planned change, as the command that makes it.
@@ -38,50 +50,73 @@ fn act(cmd: &'static str, args: &[&str], why: String) -> Action {
     Action { cmd, args: args.iter().map(|s| s.to_string()).collect(), why }
 }
 
-fn subnet24(addr: &str) -> String {
+pub fn subnet24(addr: &str) -> String {
     let mut o: Vec<&str> = addr.split('.').take(3).collect();
     o.push("0");
     format!("{}/24", o.join("."))
 }
 
-/// Pure planning step, so it can be unit-tested against fixed snapshots.
-pub fn plan(st: &Status, a: &PortArgs, routes: &dyn Fn(&str) -> Option<String>) -> Vec<Action> {
-    let mut out = Vec::new();
-    let Some(active) = st.active.as_ref() else { return out };
-    let ours: Vec<&str> = std::iter::once(a.rdma_ip.as_str()).chain(a.bridge_ip.as_deref()).collect();
+/// The peer's address in the same /24 as `ours`.
+pub fn peer_in_subnet<'a>(a: &'a PortArgs, ours: Option<&str>) -> Option<&'a str> {
+    let net = subnet24(ours?);
+    a.peer_ips.iter().find(|p| subnet24(p) == net).map(String::as_str)
+}
 
-    for p in st.ports.iter().filter(|p| p.name != active.name) {
-        for addr in &ours {
-            if p.inet.iter().any(|x| x == addr) {
-                out.push(act(IFCONFIG, &[&p.name, "inet", addr, "-alias"], format!("stale {addr} on inactive {}", p.name)));
+/// The lower RDMA address leads when the Macs must break a symmetry (see `roles`).
+pub fn is_leader(a: &PortArgs) -> bool {
+    let me = a.rdma_ip.parse::<Ipv4Addr>().ok();
+    let peer = peer_in_subnet(a, Some(&a.rdma_ip)).and_then(|p| p.parse::<Ipv4Addr>().ok());
+    match (me, peer) {
+        (Some(m), Some(p)) => m < p,
+        _ => true,
+    }
+}
+
+/// Pure planning step, so it can be unit-tested against fixed snapshots.
+pub fn plan_for(st: &Status, a: &PortArgs, layout: &Layout, routes: &dyn Fn(&str) -> Option<String>) -> Vec<Action> {
+    let mut out = Vec::new();
+    let (Some(rdma_port), Some(bridge_port)) = (layout.rdma_port(), layout.bridge_port()) else { return out };
+    let port = |name: &str| st.ports.iter().find(|p| p.name == name);
+    // Each of our addresses and the port it belongs on.
+    let ours: Vec<(&str, &str)> =
+        std::iter::once((a.rdma_ip.as_str(), rdma_port)).chain(a.bridge_ip.as_deref().map(|b| (b, bridge_port))).collect();
+
+    for p in &st.ports {
+        for (addr, target) in &ours {
+            if p.name != *target && p.inet.iter().any(|x| x == addr) {
+                let why = if p.active {
+                    format!("{addr} moves from {} to {target}", p.name)
+                } else {
+                    format!("stale {addr} on inactive {}", p.name)
+                };
+                out.push(act(IFCONFIG, &[&p.name, "inet", addr, "-alias"], why));
             }
         }
     }
-    if active.bridge_member {
-        out.push(act(IFCONFIG, &[BRIDGE, "deletem", &active.name], format!("take {} out of {BRIDGE}", active.name)));
+    for name in layout.ports() {
+        if port(name).is_some_and(|p| p.bridge_member) {
+            out.push(act(IFCONFIG, &[BRIDGE, "deletem", name], format!("take {name} out of {BRIDGE}")));
+        }
     }
     if let Some(b) = a.bridge_ip.as_deref() {
         if st.bridge_inet.iter().any(|x| x == b) {
-            out.push(act(IFCONFIG, &[BRIDGE, "inet", b, "-alias"], format!("{b} moves from {BRIDGE} to {}", active.name)));
+            out.push(act(IFCONFIG, &[BRIDGE, "inet", b, "-alias"], format!("{b} moves from {BRIDGE} to {bridge_port}")));
         }
     }
     let mut added_nets = Vec::new();
-    for addr in &ours {
-        if !active.inet.iter().any(|x| x == addr) {
-            out.push(act(
-                IFCONFIG,
-                &[&active.name, "inet", addr, "netmask", "255.255.255.0", "alias"],
-                format!("add {addr} to {}", active.name),
-            ));
+    for (addr, target) in &ours {
+        if !port(target).is_some_and(|p| p.inet.iter().any(|x| x == addr)) {
+            out.push(act(IFCONFIG, &[target, "inet", addr, "netmask", "255.255.255.0", "alias"], format!("add {addr} to {target}")));
             added_nets.push(subnet24(addr));
         }
     }
     // Adding an address installs its subnet route; judge routes on the next tick.
     for peer in a.peer_ips.iter().filter(|p| !added_nets.contains(&subnet24(p))) {
+        let net = subnet24(peer);
+        let want = ours.iter().find(|(addr, _)| subnet24(addr) == net).map(|(_, t)| *t).unwrap_or(rdma_port);
         match routes(peer) {
-            Some(ifc) if ifc == active.name => {}
+            Some(ifc) if ifc == want => {}
             other => {
-                let net = subnet24(peer);
                 if other.is_some() {
                     out.push(act(
                         ROUTE,
@@ -89,11 +124,41 @@ pub fn plan(st: &Status, a: &PortArgs, routes: &dyn Fn(&str) -> Option<String>) 
                         format!("route to {peer} uses {}", other.as_deref().unwrap_or("?")),
                     ));
                 }
-                out.push(act(ROUTE, &["-n", "add", "-net", &net, "-interface", &active.name], format!("route {net} via {}", active.name)));
+                out.push(act(ROUTE, &["-n", "add", "-net", &net, "-interface", want], format!("route {net} via {want}")));
             }
         }
     }
     out
+}
+
+/// Our addresses and routes are where the plan wants them (bridge0 cleanup
+/// alone does not stop the peer checks: macOS may keep re-adding a port).
+pub fn addresses_settled(actions: &[Action]) -> bool {
+    actions.iter().all(|x| x.args.get(1).map(String::as_str) == Some("deletem"))
+}
+
+/// Whether an `nc -z` run reached the peer: connected, or refused by its kernel.
+pub fn probe_answered(ok: bool, out: &str) -> bool {
+    ok || out.contains("Connection refused")
+}
+
+/// Does `addr` answer a TCP connect sent out of `port` (and only `port`)?
+fn probe_one(port: &str, addr: &str, tcp: u16) -> bool {
+    let (ok, out) = net::run(NC, &["-z", "-v", "-G", "1", "-b", port, addr, &tcp.to_string()]);
+    probe_answered(ok, &out)
+}
+
+/// Check the peer's addresses over the ports `layout` puts ours on.
+pub fn probe_layout(layout: &Layout, a: &PortArgs, check: &mut dyn FnMut(&str, &str) -> bool) -> Probe {
+    let rdma = layout.rdma_port().zip(peer_in_subnet(a, Some(&a.rdma_ip))).map(|(p, ip)| check(p, ip));
+    let bridge = layout.bridge_port().zip(peer_in_subnet(a, a.bridge_ip.as_deref())).map(|(p, ip)| check(p, ip));
+    Probe { rdma, bridge }
+}
+
+/// The active ports, as one comma-separated name (for the change log line).
+pub fn active_names(st: &Status) -> Option<String> {
+    let v: Vec<&str> = st.ports.iter().filter(|p| p.active).map(|p| p.name.as_str()).collect();
+    (!v.is_empty()).then(|| v.join(", "))
 }
 
 /// The log line for a change in which port is active, or `None` if unchanged.
@@ -139,24 +204,74 @@ pub fn main(a: PortArgs) -> i32 {
         eprintln!("tblink port must run as root (or pass --dry-run)");
         return 1;
     }
+    let leader = is_leader(&a);
+    let mut ctl = Controller::new(leader, a.bridge_ip.is_some(), Tuning::default());
+    let clock = Instant::now();
     let mut last_active: Option<String> = None;
+    let mut settled = false;
+    log(&format!(
+        "tblink {} port daemon: rdma {}, management {}, {}",
+        net::version(),
+        a.rdma_ip,
+        a.bridge_ip.as_deref().unwrap_or("none"),
+        if leader { "leader" } else { "follower" }
+    ));
     loop {
-        let st = net::status();
-        let now_active = st.active.as_ref().map(|p| p.name.clone());
+        let st = net::port_status();
+        let now_active = active_names(&st);
         if let Some(m) = port_change_message(&last_active, &now_active) {
             log(&m);
         }
         last_active = now_active;
+        let links = net::links(&st);
+        // Only judge the peer once our own addresses have settled where the layout puts them.
+        let probe = if settled && links.len() >= 2 {
+            probe_layout(&ctl.layout, &a, &mut |port, ip| probe_one(port, ip, a.probe_port))
+        } else {
+            Probe::default()
+        };
+        let now = clock.elapsed().as_secs();
+        for line in ctl.step(&links, probe, now) {
+            log(&line);
+        }
         // Planned against a fresh route view: route state can lag the ifconfig change.
-        let actions = plan(&st, &a, &|p| net::route_interface(p));
+        let actions = plan_for(&st, &a, &ctl.layout, &|p| net::route_interface(p));
+        settled = addresses_settled(&actions);
         for line in apply(&actions, a.dry_run, &mut |c, args| net::run(c, args)) {
             log(&line);
+        }
+        let state = DaemonState {
+            version: net::version(),
+            rdma_ip: a.rdma_ip.clone(),
+            bridge_ip: a.bridge_ip.clone(),
+            peer_ips: a.peer_ips.clone(),
+            layout: ctl.layout.clone(),
+            adapt: ctl.adapt.clone(),
+            pending: ctl.pending(now),
+            probe,
+            leader,
+            updated: net::unix_now(),
+            age_secs: None,
+        };
+        if a.dry_run {
+            if a.once {
+                println!("{}", serde_json::to_string_pretty(&state).unwrap_or_default());
+            }
+        } else if let Err(e) = write_state(std::path::Path::new(net::STATE_PATH), &state) {
+            log(&format!("cannot write {}: {e}", net::STATE_PATH));
         }
         if a.once {
             return 0;
         }
         sleep_secs(a.interval);
     }
+}
+
+/// Replace the state file in one step, so readers never see half of it.
+pub fn write_state(path: &std::path::Path, state: &DaemonState) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(state).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
 }
 
 fn unsafe_geteuid() -> u32 {
@@ -180,6 +295,7 @@ mod tests {
             active,
             bridge_member: member,
             inet: inet.iter().map(|s| s.to_string()).collect(),
+            ..Port::default()
         }
     }
     fn args() -> PortArgs {
@@ -190,7 +306,13 @@ mod tests {
             interval: 5,
             once: true,
             dry_run: true,
+            probe_port: 22,
         }
+    }
+    /// The single-cable plan: everything on the active port, as before two-cable support.
+    fn plan(st: &Status, a: &PortArgs, routes: &dyn Fn(&str) -> Option<String>) -> Vec<Action> {
+        let layout = st.active.as_ref().map(|p| Layout::Single { port: p.name.clone() }).unwrap_or_default();
+        plan_for(st, a, &layout, routes)
     }
     fn args_peers(peers: &[&str]) -> PortArgs {
         PortArgs { peer_ips: peers.iter().map(|s| s.to_string()).collect(), ..args() }
@@ -202,6 +324,7 @@ mod tests {
             bridge_members: ports.iter().filter(|p| p.bridge_member).map(|p| p.name.clone()).collect(),
             ports,
             bridge_inet: bridge_inet.iter().map(|s| s.to_string()).collect(),
+            ..Status::default()
         }
     }
     fn cmds(v: &[Action]) -> Vec<String> {
@@ -535,6 +658,214 @@ mod tests {
         for x in plan(&s, &a, &routes_via("en1")).iter().chain(plan(&settled(), &a, &routes_via("en1")).iter()) {
             assert!(x.cmd == "/sbin/ifconfig" || x.cmd == "/sbin/route", "{}", x.cmd);
         }
+    }
+
+    // ---- plan_for: two cables ----
+
+    fn split(i: &str, m: &str) -> Layout {
+        Layout::Split { inference: i.into(), management: m.into() }
+    }
+    fn two_peers() -> PortArgs {
+        args_peers(&["10.0.1.2", "10.77.0.2"])
+    }
+    /// Routes as the kernel would have them once the addresses are where `split(i, m)` puts them.
+    fn routes_split(i: &'static str, m: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |p: &str| Some(if p.starts_with("10.0.1.") { i } else { m }.to_string())
+    }
+
+    #[test]
+    fn second_cable_takes_over_management() {
+        // One cable (en2) had both; a faster one on en1 becomes the inference link.
+        let s = st(vec![port("en1", true, true, &[]), port("en2", true, false, &["10.0.1.1", "10.77.0.1"])], &[]);
+        let v = plan_for(&s, &two_peers(), &split("en1", "en2"), &routes_via("en2"));
+        assert_eq!(cmds(&v), vec!["en2 inet 10.0.1.1 -alias", "bridge0 deletem en1", "en1 inet 10.0.1.1 netmask 255.255.255.0 alias"]);
+        assert_eq!(v[0].why, "10.0.1.1 moves from en2 to en1");
+    }
+
+    #[test]
+    fn settled_split_is_left_alone() {
+        let s = st(vec![port("en1", true, false, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"])], &[]);
+        assert!(plan_for(&s, &two_peers(), &split("en1", "en2"), &routes_split("en1", "en2")).is_empty());
+    }
+
+    #[test]
+    fn split_routes_each_subnet_over_its_own_cable() {
+        let s = st(vec![port("en1", true, false, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"])], &[]);
+        // Both routes still point at en2 from the single-cable days.
+        let v = plan_for(&s, &two_peers(), &split("en1", "en2"), &routes_via("en2"));
+        assert_eq!(cmds(&v), vec!["-n delete -net 10.0.1.0/24", "-n add -net 10.0.1.0/24 -interface en1"]);
+    }
+
+    #[test]
+    fn failover_puts_both_addresses_on_the_remaining_cable() {
+        // The inference cable (en1) went away; its address is stale there.
+        let s = st(vec![port("en1", false, false, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"])], &[]);
+        let v = plan_for(&s, &two_peers(), &Layout::Single { port: "en2".into() }, &routes_via("en2"));
+        assert_eq!(cmds(&v), vec!["en1 inet 10.0.1.1 -alias", "en2 inet 10.0.1.1 netmask 255.255.255.0 alias"]);
+        assert_eq!(v[0].why, "stale 10.0.1.1 on inactive en1");
+    }
+
+    #[test]
+    fn swapping_roles_moves_both_addresses() {
+        let s = st(vec![port("en1", true, false, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"])], &[]);
+        let v = plan_for(&s, &two_peers(), &split("en2", "en1"), &routes_split("en1", "en2"));
+        assert_eq!(
+            cmds(&v),
+            vec![
+                "en1 inet 10.0.1.1 -alias",
+                "en2 inet 10.77.0.1 -alias",
+                "en2 inet 10.0.1.1 netmask 255.255.255.0 alias",
+                "en1 inet 10.77.0.1 netmask 255.255.255.0 alias",
+            ]
+        );
+    }
+
+    #[test]
+    fn split_takes_both_ports_out_of_the_bridge_and_moves_the_bridge_address() {
+        let s = st(vec![port("en1", true, true, &[]), port("en2", true, true, &[])], &["10.77.0.1"]);
+        let v = plan_for(&s, &two_peers(), &split("en1", "en2"), &|_| None);
+        assert_eq!(
+            cmds(&v),
+            vec![
+                "bridge0 deletem en1",
+                "bridge0 deletem en2",
+                "bridge0 inet 10.77.0.1 -alias",
+                "en1 inet 10.0.1.1 netmask 255.255.255.0 alias",
+                "en2 inet 10.77.0.1 netmask 255.255.255.0 alias",
+            ]
+        );
+        assert_eq!(v[2].why, "10.77.0.1 moves from bridge0 to en2");
+    }
+
+    #[test]
+    fn split_converges_once_applied() {
+        let before = st(
+            vec![port("en1", true, true, &[]), port("en2", true, false, &["10.0.1.1", "10.77.0.1"]), port("en6", false, true, &[])],
+            &[],
+        );
+        assert!(!plan_for(&before, &two_peers(), &split("en1", "en2"), &routes_via("en2")).is_empty());
+        let after =
+            st(vec![port("en1", true, false, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"]), port("en6", false, true, &[])], &[]);
+        assert!(plan_for(&after, &two_peers(), &split("en1", "en2"), &routes_split("en1", "en2")).is_empty());
+    }
+
+    #[test]
+    fn third_port_is_cleaned_but_unused() {
+        let s = st(
+            vec![
+                port("en1", true, false, &["10.0.1.1"]),
+                port("en2", true, false, &["10.77.0.1"]),
+                port("en6", true, true, &["10.77.0.1"]),
+            ],
+            &[],
+        );
+        let v = plan_for(&s, &two_peers(), &split("en1", "en2"), &routes_split("en1", "en2"));
+        assert_eq!(cmds(&v), vec!["en6 inet 10.77.0.1 -alias"], "en6 stays in the bridge: it is not in use");
+    }
+
+    #[test]
+    fn no_layout_plans_nothing() {
+        assert!(plan_for(&settled(), &args(), &Layout::None, &routes_via("en1")).is_empty());
+    }
+
+    #[test]
+    fn single_layout_matches_the_old_active_port_plan() {
+        // plan() in these tests is the single-cable plan; it must equal plan_for with Single(active).
+        let s = st(vec![port("en1", false, true, &["10.0.1.1"]), port("en6", true, true, &[])], &["10.77.0.1"]);
+        let a = two_peers();
+        assert_eq!(plan(&s, &a, &routes_via("en1")), plan_for(&s, &a, &Layout::Single { port: "en6".into() }, &routes_via("en1")));
+    }
+
+    // ---- peers, leader, probes ----
+
+    #[test]
+    fn peer_addresses_by_subnet() {
+        let a = two_peers();
+        assert_eq!(peer_in_subnet(&a, Some("10.0.1.1")), Some("10.0.1.2"));
+        assert_eq!(peer_in_subnet(&a, Some("10.77.0.1")), Some("10.77.0.2"));
+        assert_eq!(peer_in_subnet(&a, Some("192.168.1.1")), None);
+        assert_eq!(peer_in_subnet(&a, None), None);
+    }
+
+    #[test]
+    fn lower_rdma_address_leads() {
+        assert!(is_leader(&two_peers()));
+        let b = PortArgs {
+            rdma_ip: "10.0.1.2".into(),
+            bridge_ip: Some("10.77.0.2".into()),
+            peer_ips: vec!["10.0.1.1".into(), "10.77.0.1".into()],
+            ..args()
+        };
+        assert!(!is_leader(&b));
+        // Numeric, not text, order.
+        let c = PortArgs { rdma_ip: "10.0.1.9".into(), peer_ips: vec!["10.0.1.10".into()], ..args() };
+        assert!(is_leader(&c));
+        assert!(is_leader(&args_peers(&[])), "no peer known: lead");
+    }
+
+    #[test]
+    fn probe_answer_rules() {
+        assert!(probe_answered(true, "Connection to 10.0.1.2 port 22 [tcp/ssh] succeeded!"));
+        assert!(probe_answered(false, "nc: connectx to 10.0.1.2 port 22 (tcp) failed: Connection refused"));
+        assert!(!probe_answered(false, "nc: connectx to 10.0.1.1 port 9 (tcp) failed: Operation timed out"));
+        assert!(!probe_answered(false, "nc: connectx to 10.0.1.1 port 22 (tcp) failed: Network is unreachable"));
+    }
+
+    #[test]
+    fn probes_go_out_of_the_port_each_address_lives_on() {
+        let mut asked = Vec::new();
+        let p = probe_layout(&split("en1", "en2"), &two_peers(), &mut |port, ip| {
+            asked.push(format!("{ip} via {port}"));
+            port == "en1"
+        });
+        assert_eq!(asked, vec!["10.0.1.2 via en1", "10.77.0.2 via en2"]);
+        assert_eq!(p, Probe { rdma: Some(true), bridge: Some(false) });
+    }
+
+    #[test]
+    fn probes_without_known_peer_addresses_are_unknown() {
+        let p = probe_layout(&split("en1", "en2"), &args_peers(&[]), &mut |_, _| panic!("must not probe"));
+        assert_eq!(p, Probe::default());
+        let p = probe_layout(&Layout::None, &two_peers(), &mut |_, _| panic!("must not probe"));
+        assert_eq!(p, Probe::default());
+    }
+
+    #[test]
+    fn bridge_cleanup_alone_counts_as_settled() {
+        assert!(addresses_settled(&[]));
+        let s = st(vec![port("en1", true, true, &["10.0.1.1"]), port("en2", true, false, &["10.77.0.1"])], &[]);
+        let v = plan_for(&s, &two_peers(), &split("en1", "en2"), &routes_split("en1", "en2"));
+        assert_eq!(cmds(&v), vec!["bridge0 deletem en1"]);
+        assert!(addresses_settled(&v));
+        let moving = plan_for(&s, &two_peers(), &split("en2", "en1"), &routes_split("en1", "en2"));
+        assert!(!addresses_settled(&moving));
+    }
+
+    #[test]
+    fn active_names_for_the_change_log() {
+        assert_eq!(active_names(&settled()), Some("en6".into()));
+        let two = st(vec![port("en1", true, false, &[]), port("en6", true, false, &[])], &[]);
+        assert_eq!(active_names(&two), Some("en1, en6".into()));
+        assert_eq!(active_names(&st(vec![port("en1", false, false, &[])], &[])), None);
+    }
+
+    #[test]
+    fn state_file_is_replaced_whole() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tblink.json");
+        let state = DaemonState {
+            version: "v".into(),
+            rdma_ip: "10.0.1.1".into(),
+            layout: split("en1", "en2"),
+            updated: 100,
+            ..DaemonState::default()
+        };
+        write_state(&path, &state).unwrap();
+        write_state(&path, &state).unwrap();
+        let back = net::parse_daemon_state(&std::fs::read_to_string(&path).unwrap(), 130).unwrap();
+        assert_eq!(back.layout, split("en1", "en2"));
+        assert_eq!(back.age_secs, Some(30));
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     // ---- port_change_message ----

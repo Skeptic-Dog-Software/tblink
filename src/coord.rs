@@ -49,6 +49,11 @@ pub struct Config {
     pub jaccl_retry_secs: u64,
     #[serde(default = "d2")]
     pub jaccl_failures_before_ring: u32,
+    /// How long new port state must hold before a live deployment is rebuilt
+    /// for it. Longer than a port daemon's trial of the dedicated link (`roles`
+    /// verify time plus a few ticks), so such a trial never costs a rebuild.
+    #[serde(default = "d90")]
+    pub rebuild_settle_secs: u64,
 }
 fn default_peer_tblink() -> String {
     "/usr/local/bin/tblink".into()
@@ -61,6 +66,9 @@ fn d120() -> u64 {
 }
 fn d1800() -> u64 {
     1800
+}
+fn d90() -> u64 {
+    90
 }
 fn d2() -> u32 {
     2
@@ -99,8 +107,8 @@ pub fn desired_hosts(cfg: &Config, backend: &Backend, local: &Status, peer: &Sta
     let peer_ssh = format!("{}@{}", cfg.peer.ssh_user, cfg.peer.bridge_ip);
     match backend {
         Backend::Jaccl => {
-            let l = &local.active.as_ref().expect("jaccl needs local port").rdma_device;
-            let p = &peer.active.as_ref().expect("jaccl needs peer port").rdma_device;
+            let l = &rdma_port(local, &cfg.local.rdma_ip).expect("jaccl needs local port").rdma_device;
+            let p = &rdma_port(peer, &cfg.peer.rdma_ip).expect("jaccl needs peer port").rdma_device;
             json!([
                 {"node_id": cfg.local.node_id, "ssh": "127.0.0.1", "ips": [cfg.local.rdma_ip], "rdma": [null, l]},
                 {"node_id": cfg.peer.node_id, "ssh": peer_ssh, "ips": [cfg.peer.rdma_ip], "rdma": [p, null]},
@@ -113,9 +121,52 @@ pub fn desired_hosts(cfg: &Config, backend: &Backend, local: &Status, peer: &Sta
     }
 }
 
-/// A port is usable for JACCL once the port daemon has put the RDMA address on it.
+/// The port carrying a Mac's RDMA address: with two cables that is the
+/// inference cable, not necessarily the first active port.
+pub fn rdma_port<'a>(st: &'a Status, rdma_ip: &str) -> Option<&'a net::Port> {
+    st.port_with(rdma_ip).or(st.active.as_ref())
+}
+
+/// A port is usable for JACCL once the port daemon has put the RDMA address on
+/// it, and both Macs have it on the same cable (when the cable is known).
 pub fn jaccl_ready(cfg: &Config, local: &Status, peer: &Status) -> bool {
-    local.active_has(&cfg.local.rdma_ip) && peer.active_has(&cfg.peer.rdma_ip)
+    match (local.port_with(&cfg.local.rdma_ip), peer.port_with(&cfg.peer.rdma_ip)) {
+        (Some(l), Some(p)) => match (&l.cable_id, &p.cable_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// Which link inference uses, for the log.
+pub fn link_summary(cfg: &Config, local: &Status, peer: &Status) -> String {
+    let speed = |p: &net::Port| p.speed_gbps.map(|s| format!("{s} Gb/s")).unwrap_or("speed unknown".into());
+    let (Some(l), Some(p)) = (local.port_with(&cfg.local.rdma_ip), peer.port_with(&cfg.peer.rdma_ip)) else {
+        return "inference link: none (RDMA addresses not up on both Macs)".into();
+    };
+    let shared = l.inet.contains(&cfg.local.bridge_ip);
+    let mut s = format!(
+        "inference link: {} ({}) here, {} on {}, {}",
+        l.name,
+        speed(l),
+        p.name,
+        peer.hostname,
+        if shared {
+            "shared with management (one cable)".to_string()
+        } else {
+            match local.port_with(&cfg.local.bridge_ip) {
+                Some(m) => format!("dedicated; management on {} ({})", m.name, speed(m)),
+                None => "dedicated".to_string(),
+            }
+        }
+    );
+    if let (Some(a), Some(b)) = (&l.cable_id, &p.cable_id) {
+        if a != b {
+            s.push_str("; WARNING: the two Macs have it on different cables");
+        }
+    }
+    s
 }
 
 /// JACCL when both RDMA ports are ready and no Ring fallback is in force.
@@ -214,6 +265,18 @@ pub fn deployment_body(plan_request: &Value, backend: &Backend, plan: &Value, ho
     body
 }
 
+/// A warning when the other Mac runs a different tblink build.
+pub fn version_warning(ours: &str, theirs: &str) -> Option<String> {
+    if theirs == ours {
+        return None;
+    }
+    Some(if theirs.is_empty() {
+        format!("the other Mac runs an older tblink (0.1, no version reported); this Mac runs {ours}. Install the same build on both Macs.")
+    } else {
+        format!("the other Mac runs tblink {theirs}; this Mac runs {ours}. Install the same build on both Macs.")
+    })
+}
+
 /// Whether a `/load` response reports the deployment loaded.
 pub fn load_ok(resp: &Value) -> bool {
     resp["loaded"].as_bool() == Some(true)
@@ -231,9 +294,16 @@ pub fn config_problems(cfg: &Config, key_present: bool) -> Vec<String> {
     out
 }
 
-struct Api {
-    base: String,
-    key: String,
+/// Read and parse a coordinator config.
+pub fn load_config(config_path: &str) -> Result<Config, String> {
+    std::fs::read_to_string(expand(config_path))
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+}
+
+pub struct Api {
+    pub base: String,
+    pub key: String,
 }
 
 impl Api {
@@ -242,10 +312,10 @@ impl Api {
             .set("Authorization", &format!("Bearer {}", self.key))
             .timeout(Duration::from_secs(timeout))
     }
-    fn get(&self, path: &str) -> Result<Value, String> {
+    pub fn get(&self, path: &str) -> Result<Value, String> {
         self.req("GET", path, 20).call().map_err(err)?.into_json().map_err(|e| e.to_string())
     }
-    fn post(&self, path: &str, body: Option<&Value>, timeout: u64) -> Result<Value, String> {
+    pub fn post(&self, path: &str, body: Option<&Value>, timeout: u64) -> Result<Value, String> {
         let r = self.req("POST", path, timeout);
         let resp = match body {
             Some(b) => r.send_json(b.clone()),
@@ -266,11 +336,11 @@ fn err(e: ureq::Error) -> String {
     }
 }
 
-fn read_key(path: &str) -> Option<String> {
+pub fn read_key(path: &str) -> Option<String> {
     key_from_settings(&std::fs::read_to_string(expand(path)).ok()?)
 }
 
-fn healthy(base: &str) -> bool {
+pub fn healthy(base: &str) -> bool {
     ureq::get(&format!("{base}/health"))
         .timeout(Duration::from_secs(5))
         .call()
@@ -284,7 +354,7 @@ fn listening(addr: &str, port: u16) -> bool {
     addr.parse().map(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_secs(2)).is_ok()).unwrap_or(false)
 }
 
-fn listen_config(settings_path: &str) -> (Vec<String>, u16) {
+pub fn listen_config(settings_path: &str) -> (Vec<String>, u16) {
     parse_listen_config(std::fs::read_to_string(expand(settings_path)).ok().as_deref())
 }
 
@@ -293,30 +363,37 @@ fn local_has_addr(addr: &str) -> bool {
     net::parse_inet(&out).iter().any(|a| a == addr)
 }
 
-fn peer_status(cfg: &Config) -> Option<Status> {
+/// Run `remote` on `user@host` with the cluster key, never prompting.
+pub fn ssh_run(user: &str, host: &str, key: &str, remote: &[&str]) -> (bool, String) {
+    let target = format!("{user}@{host}");
+    let key = expand(key);
+    let mut args = vec![
+        "-i",
+        &key,
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        &target,
+    ];
+    args.extend_from_slice(remote);
+    net::run("/usr/bin/ssh", &args)
+}
+
+/// The JSON object in command output that may also carry ssh warnings.
+pub fn json_line(out: &str) -> Option<&str> {
+    out.lines().map(str::trim).find(|l| l.starts_with('{'))
+}
+
+pub fn peer_status(cfg: &Config) -> Option<Status> {
     for ip in [&cfg.peer.bridge_ip, &cfg.peer.rdma_ip] {
-        let target = format!("{}@{}", cfg.peer.ssh_user, ip);
-        let (ok, out) = net::run(
-            "/usr/bin/ssh",
-            &[
-                "-i",
-                &expand(&cfg.ssh_key),
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=3",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &target,
-                &cfg.peer_tblink,
-                "status",
-                "--json",
-            ],
-        );
+        let (ok, out) = ssh_run(&cfg.peer.ssh_user, ip, &cfg.ssh_key, &[&cfg.peer_tblink, "status", "--json"]);
         if ok {
-            if let Ok(s) = serde_json::from_str::<Status>(out.trim()) {
+            if let Some(s) = json_line(&out).and_then(|l| serde_json::from_str::<Status>(l).ok()) {
                 return Some(s);
             }
         }
@@ -332,6 +409,10 @@ struct State {
     ring_until: Option<Instant>,
     down_since: Option<Instant>,
     last_note: String,
+    last_link: String,
+    peer_version_warned: String,
+    /// The deployment the ports call for, and since when, while another one is still live.
+    want: Option<(String, Instant)>,
 }
 
 impl State {
@@ -346,6 +427,16 @@ impl State {
             return true;
         }
         false
+    }
+    /// How long the ports have called for `key`; restarts when the call changes.
+    fn wanted_for(&mut self, key: &str) -> u64 {
+        match &self.want {
+            Some((k, t)) if k == key => t.elapsed().as_secs(),
+            _ => {
+                self.want = Some((key.to_string(), Instant::now()));
+                0
+            }
+        }
     }
     /// A Ring fallback is in force.
     fn ring_hold(&self) -> bool {
@@ -366,10 +457,7 @@ impl State {
 }
 
 pub fn main(config_path: &str, once: bool, check: bool) -> i32 {
-    let cfg: Config = match std::fs::read_to_string(expand(config_path))
-        .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-    {
+    let cfg: Config = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cannot read {config_path}: {e}");
@@ -384,9 +472,15 @@ pub fn main(config_path: &str, once: bool, check: bool) -> i32 {
         }
         println!("oMLX at {}: {}", cfg.api, if healthy(&cfg.api) { "healthy" } else { "not answering" });
         match peer_status(&cfg) {
-            Some(p) => println!("peer {}: active port {}", p.hostname, p.active.map(|a| a.name).unwrap_or("none".into())),
+            Some(p) => {
+                println!("peer {}: active port {}", p.hostname, p.active.as_ref().map(|a| a.name.as_str()).unwrap_or("none"));
+                if let Some(w) = version_warning(&net::version(), &p.version) {
+                    println!("{w}");
+                }
+            }
             None => println!("peer: not reachable over SSH, or {} missing there", cfg.peer_tblink),
         }
+        println!("for a full check of both Macs, run `tblink doctor`");
         return if problems.is_empty() { 0 } else { 1 };
     }
     let marker = marker_path(config_path);
@@ -430,10 +524,7 @@ pub fn to_unload(deps: &Value, status: &Value, model: &str) -> Vec<String> {
 
 /// `tblink shutdown`: pause the coordinator, unload the deployment, stop oMLX.
 pub fn shutdown(config_path: &str) -> i32 {
-    let cfg: Config = match std::fs::read_to_string(expand(config_path))
-        .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-    {
+    let cfg: Config = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cannot read {config_path}: {e}");
@@ -534,6 +625,18 @@ fn tick(cfg: &Config, st: &mut State) {
         return;
     };
 
+    let link = link_summary(cfg, &local, &peer);
+    if link != st.last_link {
+        log(&link);
+        st.last_link = link;
+    }
+    if let Some(w) = version_warning(&net::version(), &peer.version) {
+        if st.peer_version_warned != peer.version {
+            log(&w);
+            st.peer_version_warned = peer.version.clone();
+        }
+    }
+
     let backend = choose_backend(cfg, &local, &peer, st.ring_hold());
     let want_hosts = desired_hosts(cfg, &backend, &local, &peer);
     let backend_name = backend.name();
@@ -567,11 +670,27 @@ fn tick(cfg: &Config, st: &mut State) {
         }
         st.note(format!(
             "ok: {cur_id} live on {backend_name} ({} ↔ {})",
-            local.active.as_ref().map(|p| p.rdma_device.as_str()).unwrap_or("-"),
-            peer.active.as_ref().map(|p| p.rdma_device.as_str()).unwrap_or("-")
+            rdma_port(&local, &cfg.local.rdma_ip).map(|p| p.rdma_device.as_str()).unwrap_or("-"),
+            rdma_port(&peer, &cfg.peer.rdma_ip).map(|p| p.rdma_device.as_str()).unwrap_or("-")
         ));
+        st.want = None;
         return;
     }
+    // A live deployment that no longer matches: make sure the new port state holds
+    // (a flapping cable, or the port daemons still settling) before tearing it down.
+    if let Decision::Rebuild { previous, unload } = &decision {
+        if !unload.is_empty() {
+            let held = st.wanted_for(&format!("{backend_name} {want_hosts}"));
+            if held < cfg.rebuild_settle_secs {
+                st.note(format!(
+                    "ports now call for {backend_name}; {previous} stays up until that holds for {} s",
+                    cfg.rebuild_settle_secs
+                ));
+                return;
+            }
+        }
+    }
+    st.want = None;
     st.down_since.get_or_insert_with(Instant::now);
     if !State::due(st.last_load, cfg.backoff_secs) {
         return;
@@ -653,11 +772,19 @@ mod tests {
             active: true,
             bridge_member: false,
             inet: inet.iter().map(|s| s.to_string()).collect(),
+            ..Port::default()
         };
-        Status { hostname: "h".into(), active: Some(p.clone()), ports: vec![p], bridge_inet: vec![], bridge_members: vec![] }
+        Status {
+            hostname: "h".into(),
+            active: Some(p.clone()),
+            ports: vec![p],
+            bridge_inet: vec![],
+            bridge_members: vec![],
+            ..Status::default()
+        }
     }
     fn unplugged() -> Status {
-        Status { hostname: "h".into(), active: None, ports: vec![], bridge_inet: vec![], bridge_members: vec![] }
+        Status { hostname: "h".into(), active: None, ports: vec![], bridge_inet: vec![], bridge_members: vec![], ..Status::default() }
     }
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1168,6 +1295,99 @@ mod tests {
         std::fs::write(marker_path(cfg.to_str().unwrap()), "x").unwrap();
         assert_eq!(resume(cfg.to_str().unwrap()), 0);
         assert!(!marker_path(cfg.to_str().unwrap()).exists());
+    }
+
+    // ---- ssh output ----
+
+    #[test]
+    fn json_line_skips_ssh_warnings() {
+        let out = "{\"hostname\":\"b\"}\nWarning: Permanently added '10.77.0.2' (ED25519) to the list of known hosts.\n";
+        assert_eq!(json_line(out), Some("{\"hostname\":\"b\"}"));
+        assert_eq!(json_line("Warning: x\n  {\"a\":1}\n"), Some("{\"a\":1}"));
+        assert_eq!(json_line("bash: tblink: command not found\n"), None);
+    }
+
+    #[test]
+    fn old_peer_status_still_parses() {
+        // tblink 0.1 on the other Mac: no version, speeds or roles.
+        let old = r#"{"hostname":"b","active":{"name":"en2","rdma_device":"rdma_en2","active":true,"bridge_member":false,"inet":["10.0.1.2","10.77.0.2"]},"ports":[{"name":"en2","rdma_device":"rdma_en2","active":true,"bridge_member":false,"inet":["10.0.1.2","10.77.0.2"]}],"bridge_inet":[],"bridge_members":[]}"#;
+        let st: Status = serde_json::from_str(old).unwrap();
+        assert_eq!(st.version, "");
+        assert_eq!(st.ports[0].speed_gbps, None);
+        assert!(jaccl_ready(&cfg(), &status("rdma_en6", &["10.0.1.1"]), &st));
+        assert_eq!(
+            version_warning("0.2.0", &st.version).unwrap(),
+            "the other Mac runs an older tblink (0.1, no version reported); this Mac runs 0.2.0. Install the same build on both Macs."
+        );
+    }
+
+    #[test]
+    fn version_warnings() {
+        assert_eq!(version_warning("0.2.0 (abc)", "0.2.0 (abc)"), None);
+        assert!(version_warning("0.2.0 (abc)", "0.2.0 (def)").unwrap().contains("runs tblink 0.2.0 (def)"));
+    }
+
+    // ---- two cables ----
+
+    fn two_cable_status(rdma_port: &str, bridge_port: &str, rdma: &str, bridge: &str, ids: (&str, &str)) -> Status {
+        let mk = |name: &str, inet: Vec<String>, id: &str, speed: u32| Port {
+            name: name.into(),
+            rdma_device: format!("rdma_{name}"),
+            active: true,
+            inet,
+            cable_id: Some(id.into()),
+            speed_gbps: Some(speed),
+            ..Port::default()
+        };
+        let ports = vec![mk(rdma_port, vec![rdma.into()], ids.0, 80), mk(bridge_port, vec![bridge.into()], ids.1, 40)];
+        Status { hostname: "h".into(), active: Some(ports[0].clone()), ports, ..Status::default() }
+    }
+
+    #[test]
+    fn jaccl_uses_the_inference_port_not_the_first_active_one() {
+        let c = cfg();
+        // Here: inference on en6, management on en1 (en1 sorts first).
+        let mut local = two_cable_status("en6", "en1", "10.0.1.1", "10.77.0.1", ("tb5", "tb4"));
+        local.active = Some(local.ports[1].clone());
+        let peer = two_cable_status("en1", "en2", "10.0.1.2", "10.77.0.2", ("tb5", "tb4"));
+        assert!(jaccl_ready(&c, &local, &peer));
+        let h = desired_hosts(&c, &Backend::Jaccl, &local, &peer);
+        assert_eq!(h[0]["rdma"], json!([null, "rdma_en6"]));
+        assert_eq!(h[1]["rdma"], json!(["rdma_en1", null]));
+        // Ring still goes over the management addresses.
+        assert_eq!(desired_hosts(&c, &Backend::Ring, &local, &peer)[1]["ips"], json!(["10.77.0.2"]));
+    }
+
+    #[test]
+    fn jaccl_waits_while_the_macs_use_different_cables() {
+        let c = cfg();
+        let local = two_cable_status("en6", "en1", "10.0.1.1", "10.77.0.1", ("tb5", "tb4"));
+        let peer = two_cable_status("en2", "en1", "10.0.1.2", "10.77.0.2", ("tb4", "tb5"));
+        assert!(!jaccl_ready(&c, &local, &peer));
+        assert_eq!(choose_backend(&c, &local, &peer, false), Backend::Ring);
+        assert!(link_summary(&c, &local, &peer).contains("WARNING: the two Macs have it on different cables"));
+    }
+
+    #[test]
+    fn link_summary_names_the_inference_link() {
+        let c = cfg();
+        let local = two_cable_status("en6", "en1", "10.0.1.1", "10.77.0.1", ("tb5", "tb4"));
+        let peer = two_cable_status("en1", "en2", "10.0.1.2", "10.77.0.2", ("tb5", "tb4"));
+        assert_eq!(link_summary(&c, &local, &peer), "inference link: en6 (80 Gb/s) here, en1 on h, dedicated; management on en1 (40 Gb/s)");
+        let (l, p) = jaccl_pair();
+        assert_eq!(link_summary(&c, &l, &p), "inference link: en6 (speed unknown) here, en1 on h, shared with management (one cable)");
+        assert_eq!(link_summary(&c, &unplugged(), &p), "inference link: none (RDMA addresses not up on both Macs)");
+    }
+
+    #[test]
+    fn rebuild_waits_for_the_ports_to_hold() {
+        let mut s = State::default();
+        assert_eq!(s.wanted_for("jaccl A"), 0);
+        assert_eq!(s.wanted_for("jaccl A"), 0);
+        s.want = Some(("jaccl A".into(), Instant::now().checked_sub(Duration::from_secs(61)).unwrap()));
+        assert!(s.wanted_for("jaccl A") >= 61);
+        assert_eq!(s.wanted_for("jaccl B"), 0, "a different call restarts the clock");
+        assert_eq!(cfg().rebuild_settle_secs, 90);
     }
 
     // ---- --check ----

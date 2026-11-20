@@ -4,10 +4,15 @@
 //!   tblink status [--json]
 //!   tblink port --rdma-ip 10.0.1.N [--bridge-ip 10.77.0.N] [--peer IP]... [--interval 5] [--once] [--dry-run]
 //!   tblink coordinator --config PATH [--once] [--check]
+//!   tblink setup | doctor | shutdown | resume | version
 
 mod coord;
+mod doctor;
 mod net;
 mod port;
+mod roles;
+mod setup;
+mod tb;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,11 +33,14 @@ pub fn sleep_secs(s: u64) {
 }
 
 const USAGE: &str = "usage:
-  tblink status [--json]
-  tblink port --rdma-ip 10.0.1.N [--bridge-ip 10.77.0.N] [--peer IP]... [--interval SECS] [--once] [--dry-run]
+  tblink setup                      guided setup of this Mac (run on both Macs)
+  tblink doctor [--config PATH]     check both Macs, the cables, roles, versions and oMLX
+  tblink status [--json]            ports, speeds, the Mac at the other end, and roles
+  tblink port --rdma-ip 10.0.1.N [--bridge-ip 10.77.0.N] [--peer IP]... [--interval SECS] [--probe-port 22] [--once] [--dry-run]
   tblink coordinator --config PATH [--once] [--check]
   tblink shutdown [--config PATH]   pause the coordinator, unload the model, stop oMLX
-  tblink resume [--config PATH]     let the coordinator bring the model back";
+  tblink resume [--config PATH]     let the coordinator bring the model back
+  tblink version";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq)]
@@ -42,6 +50,9 @@ enum Cmd {
     Coordinator { config: String, once: bool, check: bool },
     Shutdown { config: String },
     Resume { config: String },
+    Setup { config: String },
+    Doctor { config: String },
+    Version,
 }
 
 /// Parse the arguments after the program name. `None` means print usage.
@@ -59,11 +70,15 @@ fn parse(args: &[String]) -> Option<Cmd> {
                 interval: value("--interval").and_then(|s| s.parse().ok()).unwrap_or(5),
                 once: flag("--once"),
                 dry_run: flag("--dry-run"),
+                probe_port: value("--probe-port").and_then(|s| s.parse().ok()).unwrap_or(22),
             })
         }),
         Some("coordinator") => value("--config").map(|config| Cmd::Coordinator { config, once: flag("--once"), check: flag("--check") }),
         Some("shutdown") => Some(Cmd::Shutdown { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
         Some("resume") => Some(Cmd::Resume { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
+        Some("setup") => Some(Cmd::Setup { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
+        Some("doctor") => Some(Cmd::Doctor { config: value("--config").unwrap_or_else(|| coord::DEFAULT_CONFIG.into()) }),
+        Some("version" | "--version" | "-V") => Some(Cmd::Version),
         _ => None,
     }
 }
@@ -76,7 +91,7 @@ fn main() {
             if json {
                 println!("{}", serde_json::to_string(&st).unwrap());
             } else {
-                println!("{}", serde_json::to_string_pretty(&st).unwrap());
+                print!("{}", net::render(&st));
             }
             0
         }
@@ -84,6 +99,12 @@ fn main() {
         Some(Cmd::Coordinator { config, once, check }) => coord::main(&config, once, check),
         Some(Cmd::Shutdown { config }) => coord::shutdown(&config),
         Some(Cmd::Resume { config }) => coord::resume(&config),
+        Some(Cmd::Setup { config }) => setup::main(&config),
+        Some(Cmd::Doctor { config }) => doctor::main(&config),
+        Some(Cmd::Version) => {
+            println!("tblink {}", net::version());
+            0
+        }
         None => {
             eprintln!("{USAGE}");
             2
@@ -137,7 +158,15 @@ mod tests {
     fn port_minimal_uses_defaults() {
         assert_eq!(
             port_args("port --rdma-ip 10.0.1.2"),
-            port::PortArgs { rdma_ip: "10.0.1.2".into(), bridge_ip: None, peer_ips: vec![], interval: 5, once: false, dry_run: false }
+            port::PortArgs {
+                rdma_ip: "10.0.1.2".into(),
+                bridge_ip: None,
+                peer_ips: vec![],
+                interval: 5,
+                once: false,
+                dry_run: false,
+                probe_port: 22
+            }
         );
     }
 
@@ -153,6 +182,7 @@ mod tests {
                 interval: 5,
                 once: false,
                 dry_run: false,
+                probe_port: 22,
             }
         );
     }
@@ -228,8 +258,34 @@ mod tests {
 
     #[test]
     fn usage_lists_every_subcommand() {
-        for s in ["tblink status", "tblink port", "tblink coordinator", "tblink shutdown", "tblink resume"] {
+        for s in [
+            "tblink status",
+            "tblink port",
+            "tblink coordinator",
+            "tblink shutdown",
+            "tblink resume",
+            "tblink setup",
+            "tblink doctor",
+            "tblink version",
+        ] {
             assert!(USAGE.contains(s), "{s}");
         }
+    }
+
+    #[test]
+    fn setup_doctor_and_version() {
+        assert_eq!(p("setup"), Some(Cmd::Setup { config: coord::DEFAULT_CONFIG.into() }));
+        assert_eq!(p("doctor"), Some(Cmd::Doctor { config: coord::DEFAULT_CONFIG.into() }));
+        assert_eq!(p("doctor --config /c.json"), Some(Cmd::Doctor { config: "/c.json".into() }));
+        for v in ["version", "--version", "-V"] {
+            assert_eq!(p(v), Some(Cmd::Version));
+        }
+    }
+
+    #[test]
+    fn port_probe_port() {
+        assert_eq!(port_args("port --rdma-ip 10.0.1.2 --probe-port 2222").probe_port, 2222);
+        assert_eq!(port_args("port --rdma-ip 10.0.1.2 --probe-port none").probe_port, 22);
+        assert_eq!(port_args("port --rdma-ip 10.0.1.2 --probe-port 70000").probe_port, 22);
     }
 }

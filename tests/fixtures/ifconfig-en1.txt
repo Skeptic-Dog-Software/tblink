@@ -1,0 +1,5 @@
+en1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 02:00:00:00:00:00
+	media: autoselect <full-duplex>
+	status: inactive

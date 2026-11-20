@@ -1,0 +1,7 @@
+en2: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 02:00:00:00:00:00
+	inet 10.0.1.2 netmask 0xffffff00 broadcast 10.0.1.255
+	inet 10.77.0.2 netmask 0xffffff00 broadcast 10.77.0.255
+	media: autoselect <full-duplex>
+	status: active
